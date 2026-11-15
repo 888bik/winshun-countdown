@@ -2,6 +2,7 @@
 
 ## 1.4.0
 
+- Deferred floating window/notification wakeups are capped at 2.5 seconds even when a pending timer's next repeat is far away. Without `deferredWindow`, the nearest deadline and 30-second cap are unchanged.
 - Scheduler: replaced the permanent 1-second ticker with one `time.Timer` reset to the nearest `EndsAt`/`NextReminderAt`; no timers means the scheduler blocks. While timers are active the maximum sleep is 30 seconds as a sleep/clock-change safeguard; window `WM_POWERBROADCAST`/`WM_TIMECHANGE` wakes the scheduler. Injected `now()` remains the test clock.
 - Window loop: replaced the 10ms `PeekMessage`/`Sleep` poll with a blocking `GetMessageW` loop. Commands are posted with `WM_APP+1`; auto-close uses `SetTimer`; activity resets from mouse/keyboard messages. Hidden and non-animating windows make no polling wakeups.
 - `processDue` now scans for due work before allocating a rollback snapshot.

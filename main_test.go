@@ -718,6 +718,23 @@ func TestAnimationEasingAndReverse(t *testing.T) {
 	}
 }
 
+func TestNextWakeDelayDeferredCapped(t *testing.T) {
+	now := fixedNow()
+	p, _, _ := testPlugin(t, now)
+	p.startTimer("泡面", 60)
+	p.processDue(now.Add(60 * time.Second))
+	item := p.timerListLocked()[0]
+	item.NextReminderAt = now.Add(120 * time.Second)
+	p.deferredWindow = true
+	if got, ok := p.nextWakeDelayLocked(now.Add(60 * time.Second)); !ok || got != 2500*time.Millisecond {
+		t.Fatalf("deferred delay = %v, %v", got, ok)
+	}
+	p.deferredWindow = false
+	if got, ok := p.nextWakeDelayLocked(now.Add(60 * time.Second)); !ok || got != 30*time.Second {
+		t.Fatalf("normal delay = %v, %v", got, ok)
+	}
+}
+
 func TestNextWakeDelay(t *testing.T) {
 	now := fixedNow()
 	p, _, _ := testPlugin(t, now)

@@ -602,6 +602,20 @@ func (p *Plugin) wakeScheduler() {
 	}
 }
 
+func (p *Plugin) deferredWakeDelayLocked(now time.Time) time.Duration {
+	delay := 2500 * time.Millisecond
+	if !p.lastQueryAt.IsZero() {
+		remaining := p.lastQueryAt.Add(2500 * time.Millisecond).Sub(now)
+		if remaining < 0 {
+			remaining = 0
+		}
+		if remaining < delay {
+			delay = remaining
+		}
+	}
+	return delay
+}
+
 func (p *Plugin) nextWakeDelayLocked(now time.Time) (time.Duration, bool) {
 	var next time.Time
 	for _, item := range p.timers {
@@ -618,13 +632,21 @@ func (p *Plugin) nextWakeDelayLocked(now time.Time) (time.Duration, bool) {
 	}
 	if next.IsZero() {
 		if p.deferredWindow {
-			return 2500 * time.Millisecond, true
+			return p.deferredWakeDelayLocked(now), true
 		}
 		return 0, false
 	}
 	delay := next.Sub(now)
 	if delay < 0 {
 		delay = 0
+	}
+	// A deferred window must be reconsidered promptly even when a pending
+	// timer's next repeat is still far away. This bounds only deferred work;
+	// non-deferred schedules keep their normal deadline and 30s cap.
+	if p.deferredWindow {
+		if deferredDelay := p.deferredWakeDelayLocked(now); delay > deferredDelay {
+			delay = deferredDelay
+		}
 	}
 	if delay > 30*time.Second {
 		delay = 30 * time.Second
