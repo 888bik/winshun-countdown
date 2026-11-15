@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0
+
+- Scheduler: replaced the permanent 1-second ticker with one `time.Timer` reset to the nearest `EndsAt`/`NextReminderAt`; no timers means the scheduler blocks. While timers are active the maximum sleep is 30 seconds as a sleep/clock-change safeguard; window `WM_POWERBROADCAST`/`WM_TIMECHANGE` wakes the scheduler. Injected `now()` remains the test clock.
+- Window loop: replaced the 10ms `PeekMessage`/`Sleep` poll with a blocking `GetMessageW` loop. Commands are posted with `WM_APP+1`; auto-close uses `SetTimer`; activity resets from mouse/keyboard messages. Hidden and non-animating windows make no polling wakeups.
+- `processDue` now scans for due work before allocating a rollback snapshot.
+- Floating window: layered fade/slide entry (180ms) and fade exit (120ms), a `animations` setting (default true), and a system `SPI_GETCLIENTAREAANIMATION` check. Entry/exit uses `SetLayeredWindowAttributes` + `SetWindowPos`; animation state/easing lives in `anim.go` with injected-clock tests.
+- Visible reminder refresh no longer resets the scroll position; repeat reminders update the existing window instead of bringing it to the foreground.
+- Version bumped to 1.4.0; manifest assembly version corrected to 1.4.0.0.
+- Not yet implemented in this pass: appearance/locale propagation, borderless custom title bar, DWM corners/backdrop, row-collapse animation, pulse animation, async off-lock persistence, button reuse, double-buffered paint/system message font, and multi-monitor placement. See README limitations.
+
 ## 1.3.0
 
 - 新增 `auto_close_seconds` 设置（0–600，默认 0）：悬浮窗闲置 N 秒自动隐藏；鼠标进入、点击、按键重置计时；自动关闭不确认，下一次重复提醒会再弹。

@@ -34,6 +34,8 @@ func (f *fakeWindow) SetAutoClose(seconds int) {
 	f.mu.Unlock()
 }
 
+func (f *fakeWindow) SetAnimations(bool) {}
+
 func (f *fakeWindow) Show(items []pendingItem) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -690,6 +692,49 @@ func TestFloatingStartupSuppressesNotification(t *testing.T) {
 	}
 	if !p.window.Visible() {
 		t.Fatal("startup did not show floating window")
+	}
+}
+
+func TestAnimationEasingAndReverse(t *testing.T) {
+	now := fixedNow()
+	var a animation
+	a.begin(animEnter, now, 180*time.Millisecond, 0, 1)
+	if got, done := a.progress(now); got != 0 || done {
+		t.Fatalf("start = %v %v", got, done)
+	}
+	if got, done := a.progress(now.Add(90 * time.Millisecond)); got <= 0 || got >= 1 || done {
+		t.Fatalf("mid = %v %v", got, done)
+	}
+	if got, done := a.progress(now.Add(180 * time.Millisecond)); got != 1 || !done {
+		t.Fatalf("end = %v %v", got, done)
+	}
+	a.begin(animExit, now, 120*time.Millisecond, 1, 0)
+	if got, done := a.progress(now.Add(60 * time.Millisecond)); got <= 0 || got >= 1 || done {
+		t.Fatalf("exit mid = %v %v", got, done)
+	}
+	a.begin(animEnter, now, 0, 0, 1)
+	if got, done := a.progress(now); got != 1 || !done {
+		t.Fatalf("zero duration = %v %v", got, done)
+	}
+}
+
+func TestNextWakeDelay(t *testing.T) {
+	now := fixedNow()
+	p, _, _ := testPlugin(t, now)
+	if _, ok := p.nextWakeDelayLocked(now); ok {
+		t.Fatal("idle plugin should have no wake deadline")
+	}
+	p.startTimer("泡面", 60)
+	delay, ok := p.nextWakeDelayLocked(now)
+	if !ok || delay != 30*time.Second {
+		t.Fatalf("cap delay = %v, %v", delay, ok)
+	}
+	p.settings["repeat_first_seconds"] = 10
+	p.settings["repeat_every_seconds"] = 10
+	p.processDue(now.Add(60 * time.Second))
+	delay, ok = p.nextWakeDelayLocked(now.Add(60 * time.Second))
+	if !ok || delay != 10*time.Second {
+		t.Fatalf("pending delay = %v, %v", delay, ok)
 	}
 }
 

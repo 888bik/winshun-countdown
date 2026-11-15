@@ -71,6 +71,7 @@ type windowCallbacks struct {
 	Snooze    func(id string)
 	SnoozeAll func()
 	Failed    func()
+	Wake      func()
 }
 
 type pendingItem struct {
@@ -84,6 +85,7 @@ type windowBackend interface {
 	Hide()
 	Visible() bool
 	SetAutoClose(seconds int)
+	SetAnimations(enabled bool)
 }
 
 type Plugin struct {
@@ -105,6 +107,7 @@ type Plugin struct {
 	stopped         bool
 	stopCh          chan struct{}
 	doneCh          chan struct{}
+	wakeCh          chan struct{}
 
 	now   func() time.Time
 	newID func() string
@@ -124,6 +127,7 @@ func newPlugin(out io.Writer, dataDir string, now func() time.Time, newID func()
 		timers:   map[string]*timer{},
 		now:      now,
 		newID:    newID,
+		wakeCh:   make(chan struct{}, 1),
 	}
 	p.window = newWindowBackend(windowCallbacks{
 		Ack:       p.acknowledgeFromWindow,
@@ -131,6 +135,7 @@ func newPlugin(out io.Writer, dataDir string, now func() time.Time, newID func()
 		Snooze:    p.snoozeFromWindow,
 		SnoozeAll: p.snoozeAllFromWindow,
 		Failed:    p.windowFailed,
+		Wake:      p.wakeScheduler,
 	})
 	return p
 }
@@ -174,6 +179,18 @@ func (p *Plugin) intSettingLocked(key string, fallback, minimum, maximum int) in
 		return maximum
 	}
 	return number
+}
+
+func (p *Plugin) animationsEnabledLocked() bool {
+	value, ok := p.settings["animations"]
+	if !ok {
+		return true
+	}
+	enabled, ok := value.(bool)
+	if !ok {
+		return true
+	}
+	return enabled
 }
 
 func (p *Plugin) autoCloseSecondsLocked() int {
@@ -220,8 +237,10 @@ func pageIndices(total, scroll, page int) []int {
 func (p *Plugin) applyWindowSettings() {
 	p.mu.Lock()
 	seconds := p.autoCloseSecondsLocked()
+	animations := p.animationsEnabledLocked()
 	p.mu.Unlock()
 	p.window.SetAutoClose(seconds)
+	p.window.SetAnimations(animations)
 }
 
 func (p *Plugin) pendingItemsLocked() []pendingItem {
@@ -304,6 +323,7 @@ func (p *Plugin) syncWindow(force bool) {
 		if busy || listed {
 			p.deferredWindow = true
 			p.mu.Unlock()
+			p.wakeScheduler()
 			p.window.Refresh(items)
 			return
 		}
@@ -401,6 +421,7 @@ func (p *Plugin) snoozeIDs(ids []string) ([]string, int, bool) {
 	}
 	p.listVisible = false
 	p.mu.Unlock()
+	p.wakeScheduler()
 	return titles, minutes, true
 }
 
@@ -456,6 +477,7 @@ func (p *Plugin) confirmPending(id string) bool {
 	}
 	p.listVisible = false
 	p.mu.Unlock()
+	p.wakeScheduler()
 	return true
 }
 
@@ -537,17 +559,77 @@ func (p *Plugin) stop() {
 func (p *Plugin) run() {
 	defer close(p.doneCh)
 	p.load()
-	ticker := time.NewTicker(tickInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
 	for {
+		p.mu.Lock()
+		delay, hasDeadline := p.nextWakeDelayLocked(p.now())
+		p.mu.Unlock()
+		if !hasDeadline {
+			select {
+			case <-p.stopCh:
+				return
+			case <-p.wakeCh:
+				continue
+			}
+		}
+		timer.Reset(delay)
 		select {
 		case <-p.stopCh:
 			return
-		case <-ticker.C:
+		case <-p.wakeCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			continue
+		case <-timer.C:
 			p.processDue(p.now())
 			p.flushDeferredWindow()
 		}
 	}
+}
+
+func (p *Plugin) wakeScheduler() {
+	select {
+	case p.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Plugin) nextWakeDelayLocked(now time.Time) (time.Duration, bool) {
+	var next time.Time
+	for _, item := range p.timers {
+		candidate := item.NextReminderAt
+		if item.Status != statusPending {
+			candidate = item.EndsAt
+		}
+		if candidate.IsZero() {
+			continue
+		}
+		if next.IsZero() || candidate.Before(next) {
+			next = candidate
+		}
+	}
+	if next.IsZero() {
+		if p.deferredWindow {
+			return 2500 * time.Millisecond, true
+		}
+		return 0, false
+	}
+	delay := next.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	if delay > 30*time.Second {
+		delay = 30 * time.Second
+	}
+	return delay, true
 }
 
 func (p *Plugin) timerListLocked() []*timer {
@@ -746,6 +828,18 @@ func (p *Plugin) failCorrupt(message string) {
 
 func (p *Plugin) processDue(now time.Time) {
 	p.mu.Lock()
+	hasDue := false
+	for _, item := range p.timers {
+		if (item.Status == statusRunning && !item.EndsAt.After(now)) ||
+			(item.Status == statusPending && !item.NextReminderAt.After(now)) {
+			hasDue = true
+			break
+		}
+	}
+	if !hasDue {
+		p.mu.Unlock()
+		return
+	}
 	before := make(map[string]timer, len(p.timers))
 	for id, item := range p.timers {
 		before[id] = *item
@@ -1159,6 +1253,7 @@ func (p *Plugin) startTimer(title string, seconds int64) map[string]any {
 	}
 	p.listVisible = false
 	p.mu.Unlock()
+	p.wakeScheduler()
 	p.notifyToast("倒计时已开始：" + title + " " + humanDuration(seconds))
 	return map[string]any{"effects": []map[string]any{{"type": "hide"}}}
 }
@@ -1184,6 +1279,7 @@ func (p *Plugin) cancelTimer(id string) map[string]any {
 	visible := p.listVisible
 	p.listVisible = false
 	p.mu.Unlock()
+	p.wakeScheduler()
 	p.notifyToast("已取消：" + item.Title)
 	if visible {
 		p.refreshList()
@@ -1207,6 +1303,7 @@ func (p *Plugin) acknowledgeTimer(id string) map[string]any {
 	}
 	p.listVisible = false
 	p.mu.Unlock()
+	p.wakeScheduler()
 	p.syncWindow(false)
 	p.refreshList()
 	return map[string]any{"effects": []map[string]any{
@@ -1323,6 +1420,7 @@ func (p *Plugin) handleLine(line []byte) bool {
 		p.mu.Unlock()
 		p.applyWindowSettings()
 		p.syncWindow(false)
+		p.wakeScheduler()
 		return false
 	case "shutdown":
 		p.flush()

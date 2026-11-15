@@ -15,5 +15,6 @@ func (stubWindow) Refresh([]pendingItem)   {}
 func (stubWindow) Hide()                   {}
 func (stubWindow) Visible() bool           { return false }
 func (stubWindow) SetAutoClose(int)        {}
+func (stubWindow) SetAnimations(bool)      {}
 
 func initDpiAwareness() {}

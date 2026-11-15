@@ -14,42 +14,48 @@ import (
 )
 
 const (
-	wmDestroy     = 0x0002
-	wmClose       = 0x0010
-	wmPaint       = 0x000F
-	wmEraseBkgnd  = 0x0014
-	wmMouseMove   = 0x0200
-	wmLButtonDown = 0x0201
-	wmKeyDown     = 0x0100
-	wmVScroll     = 0x0115
-	wmMouseWheel  = 0x020A
-	wmLButtonUp   = 0x0202
-	wmDpiChanged  = 0x02E0
-	wmQuit        = 0x0012
-	wmCommand     = 0x0111
-	wmSetFont     = 0x0030
-	bsPushButton  = 0x00000000
-	wsChild       = 0x40000000
-	wsVisible     = 0x10000000
-	bnClicked     = 0
-	wsCaption     = 0x00C00000
-	wsSysMenu     = 0x00080000
-	wsVScroll     = 0x00200000
-	wsExTool      = 0x00000080
-	wsExTopmost   = 0x00000008
-	swHide        = 0
-	swShow        = 5
-	sbVert        = 1
-	sifRangePage  = 0x0003
-	sifPos        = 0x0004
-	dtLeft        = 0x0000
-	dtCenter      = 0x0001
-	dtVCenter     = 0x0004
-	dtSingleLine  = 0x0020
-	dtEndEllipsis = 0x8000
-	dtNoPrefix    = 0x0800
-	swpNoZOrder   = 0x0004
-	swpNoActivate = 0x0010
+	wmDestroy        = 0x0002
+	wmClose          = 0x0010
+	wmPaint          = 0x000F
+	wmEraseBkgnd     = 0x0014
+	wmMouseMove      = 0x0200
+	wmLButtonDown    = 0x0201
+	wmKeyDown        = 0x0100
+	wmVScroll        = 0x0115
+	wmMouseWheel     = 0x020A
+	wmLButtonUp      = 0x0202
+	wmDpiChanged     = 0x02E0
+	wmQuit           = 0x0012
+	wmCommand        = 0x0111
+	wmSetFont        = 0x0030
+	wmTimer          = 0x0113
+	wmAppCommand     = 0x8000 + 1
+	wmPowerBroadcast = 0x0218
+	wmTimeChange     = 0x001E
+	bsPushButton     = 0x00000000
+	wsChild          = 0x40000000
+	wsVisible        = 0x10000000
+	bnClicked        = 0
+	wsCaption        = 0x00C00000
+	wsSysMenu        = 0x00080000
+	wsVScroll        = 0x00200000
+	wsExTool         = 0x00000080
+	wsExTopmost      = 0x00000008
+	swHide           = 0
+	swShow           = 5
+	swShowNoActivate = 4
+	sbVert           = 1
+	sifRangePage     = 0x0003
+	sifPos           = 0x0004
+	dtLeft           = 0x0000
+	dtCenter         = 0x0001
+	dtVCenter        = 0x0004
+	dtSingleLine     = 0x0020
+	dtEndEllipsis    = 0x8000
+	dtNoPrefix       = 0x0800
+	swpNoZOrder      = 0x0004
+	swpNoActivate    = 0x0010
+	swpNoSize        = 0x0001
 )
 
 type point struct {
@@ -129,6 +135,11 @@ var (
 	procUpdateWindow                 = user32.NewProc("UpdateWindow")
 	procSetForegroundWindow          = user32.NewProc("SetForegroundWindow")
 	procGetMessageW                  = user32.NewProc("GetMessageW")
+	procPostMessageW                 = user32.NewProc("PostMessageW")
+	procSetTimer                     = user32.NewProc("SetTimer")
+	procKillTimer                    = user32.NewProc("KillTimer")
+	procSetLayeredWindowAttributes   = user32.NewProc("SetLayeredWindowAttributes")
+	procSystemParametersInfoW        = user32.NewProc("SystemParametersInfoW")
 	procPeekMessageW                 = user32.NewProc("PeekMessageW")
 	procTranslateMessage             = user32.NewProc("TranslateMessage")
 	procDispatchMessageW             = user32.NewProc("DispatchMessageW")
@@ -166,9 +177,10 @@ var (
 )
 
 type winCommand struct {
-	kind    int
-	items   []pendingItem
-	seconds int
+	kind       int
+	items      []pendingItem
+	seconds    int
+	animations bool
 }
 
 const (
@@ -176,17 +188,25 @@ const (
 	winRefresh
 	winHide
 	winAutoClose
+	winAnimations
 )
 
 type winBackend struct {
 	callbacks windowCallbacks
-	commands  chan winCommand
 	once      sync.Once
+
+	cmdMu       sync.Mutex
+	pendingCmds []winCommand
 
 	visible      atomic.Bool
 	autoClose    atomic.Int64
 	lastActivity time.Time
-	lastCursor   point
+	animations   bool
+	alpha        int
+	anim         animation
+	animTimer    bool
+	baseX        int
+	baseY        int
 
 	// The fields below are owned by the GUI thread after create.
 	hwnd            uintptr
@@ -207,16 +227,40 @@ type winBackend struct {
 func newWindowBackend(callbacks windowCallbacks) windowBackend {
 	return &winBackend{
 		callbacks: callbacks,
-		commands:  make(chan winCommand, 64),
 		dpi:       96,
 	}
 }
 
 func (b *winBackend) post(command winCommand) {
-	select {
-	case b.commands <- command:
-	default:
-		// Snapshots are small; a full queue only drops an intermediate frame.
+	b.cmdMu.Lock()
+	b.pendingCmds = append(b.pendingCmds, command)
+	hwnd := b.hwnd
+	b.cmdMu.Unlock()
+	if hwnd != 0 {
+		procPostMessageW.Call(hwnd, wmAppCommand, 0, 0)
+	}
+}
+
+func (b *winBackend) drainCommands() {
+	b.cmdMu.Lock()
+	commands := b.pendingCmds
+	b.pendingCmds = nil
+	b.cmdMu.Unlock()
+	for _, command := range commands {
+		switch command.kind {
+		case winShow:
+			b.showOnGUI(command.items)
+		case winRefresh:
+			b.refreshOnGUI(command.items)
+		case winHide:
+			b.hideOnGUI()
+		case winAutoClose:
+			b.autoClose.Store(int64(command.seconds))
+			b.lastActivity = time.Now()
+			b.applyAutoCloseTimer()
+		case winAnimations:
+			b.animations = command.animations
+		}
 	}
 }
 
@@ -240,6 +284,10 @@ func (b *winBackend) SetAutoClose(seconds int) {
 	b.post(winCommand{kind: winAutoClose, seconds: seconds})
 }
 
+func (b *winBackend) SetAnimations(enabled bool) {
+	b.post(winCommand{kind: winAnimations, animations: enabled})
+}
+
 func (b *winBackend) Visible() bool {
 	return b.visible.Load()
 }
@@ -247,53 +295,23 @@ func (b *winBackend) Visible() bool {
 func (b *winBackend) loop() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	if !b.ensureWindow() {
+		if b.callbacks.Failed != nil {
+			b.callbacks.Failed()
+		}
+		return
+	}
+	b.drainCommands()
 	for {
 		var message msg
-		for {
-			result, _, _ := procPeekMessageW.Call(
-				uintptr(unsafe.Pointer(&message)), 0, 0, 0, 1, // PM_REMOVE
-			)
-			if result == 0 {
-				break
-			}
-			if message.message == wmQuit {
-				return
-			}
-			procTranslateMessage.Call(uintptr(unsafe.Pointer(&message)))
-			procDispatchMessageW.Call(uintptr(unsafe.Pointer(&message)))
+		result, _, _ := procGetMessageW.Call(
+			uintptr(unsafe.Pointer(&message)), 0, 0, 0,
+		)
+		if int32(result) <= 0 {
+			return
 		}
-		select {
-		case command := <-b.commands:
-			switch command.kind {
-			case winShow:
-				b.showOnGUI(command.items)
-			case winRefresh:
-				b.refreshOnGUI(command.items)
-			case winHide:
-				b.hideOnGUI()
-			case winAutoClose:
-				b.autoClose.Store(int64(command.seconds))
-				b.lastActivity = time.Now()
-			}
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-		if b.visible.Load() {
-			var cursor point
-			var windowRect rect
-			procGetCursorPos.Call(uintptr(unsafe.Pointer(&cursor)))
-			procGetWindowRect.Call(b.hwnd, uintptr(unsafe.Pointer(&windowRect)))
-			if cursor != b.lastCursor {
-				b.lastCursor = cursor
-				if cursor.x >= windowRect.left && cursor.x < windowRect.right &&
-					cursor.y >= windowRect.top && cursor.y < windowRect.bottom {
-					b.lastActivity = time.Now()
-				}
-			}
-		}
-		if b.visible.Load() && autoCloseDue(true, int(b.autoClose.Load()), time.Since(b.lastActivity)) {
-			b.hideOnGUI()
-		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&message)))
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&message)))
 	}
 }
 
@@ -349,7 +367,7 @@ func (b *winBackend) ensureWindow() bool {
 
 	activeWindowBackend = b
 	style := uintptr(wsCaption | wsSysMenu | wsVScroll)
-	exStyle := uintptr(wsExTool | wsExTopmost)
+	exStyle := uintptr(wsExTool | wsExTopmost | 0x00080000) // WS_EX_LAYERED
 	instance, _, _ := procGetModuleHandleW.Call(0)
 	hwnd, _, err := procCreateWindowExW.Call(
 		exStyle, uintptr(unsafe.Pointer(className())),
@@ -360,9 +378,13 @@ func (b *winBackend) ensureWindow() bool {
 		fmt.Fprintf(os.Stderr, "me.countdown: CreateWindowExW floating window failed: %v\n", err)
 		return false
 	}
+	b.cmdMu.Lock()
 	b.hwnd = hwnd
+	b.cmdMu.Unlock()
 	b.dpi = getDpi(hwnd)
 	b.recreateFonts()
+	b.alpha = 255
+	procSetLayeredWindowAttributes.Call(hwnd, 0, 255, 2) // LWA_ALPHA
 	return true
 }
 
@@ -418,15 +440,77 @@ func (b *winBackend) showOnGUI(items []pendingItem) {
 		return
 	}
 	b.items = append([]pendingItem(nil), items...)
-	b.scroll = 0
+	if !b.visible.Load() {
+		b.scroll = 0
+	}
 	b.layout()
-	procShowWindow.Call(b.hwnd, swShow)
+	var windowRect rect
+	procGetWindowRect.Call(b.hwnd, uintptr(unsafe.Pointer(&windowRect)))
+	b.baseX, b.baseY = int(windowRect.left), int(windowRect.top)
+	animate := b.animations && systemAnimationsEnabled()
+	if !b.visible.Load() && animate {
+		b.alpha = 0
+		procSetLayeredWindowAttributes.Call(b.hwnd, 0, 0, 2)
+		procSetWindowPos.Call(b.hwnd, 0, uintptr(b.baseX), uintptr(b.baseY+int(16*float64(b.dpi)/96)), 0, 0, swpNoZOrder|swpNoActivate|swpNoSize)
+		b.anim.begin(animEnter, time.Now(), 180*time.Millisecond, 0, 1)
+		b.ensureAnimationTimer()
+	} else if b.anim.kind == animExit {
+		b.anim.begin(animEnter, time.Now(), 180*time.Millisecond, float64(b.alpha)/255, 1)
+		b.ensureAnimationTimer()
+	}
+	procShowWindow.Call(b.hwnd, swShowNoActivate)
 	procUpdateWindow.Call(b.hwnd)
-	procSetForegroundWindow.Call(b.hwnd)
 	b.lastActivity = time.Now()
-	procGetCursorPos.Call(uintptr(unsafe.Pointer(&b.lastCursor)))
 	b.visible.Store(true)
+	b.applyAutoCloseTimer()
 	procInvalidateRect.Call(b.hwnd, 0, 0)
+}
+
+func systemAnimationsEnabled() bool {
+	var enabled int32
+	result, _, _ := procSystemParametersInfoW.Call(0x1042, 0, uintptr(unsafe.Pointer(&enabled)), 0)
+	return result != 0 && enabled != 0
+}
+
+func (b *winBackend) ensureAnimationTimer() {
+	if b.animTimer {
+		return
+	}
+	b.animTimer = true
+	procSetTimer.Call(b.hwnd, 2, 16, 0)
+}
+
+func (b *winBackend) stepAnimation() {
+	if b.anim.kind == animNone {
+		procKillTimer.Call(b.hwnd, 2)
+		b.animTimer = false
+		return
+	}
+	value, done := b.anim.progress(time.Now())
+	b.alpha = int(255 * value)
+	procSetLayeredWindowAttributes.Call(b.hwnd, 0, uintptr(b.alpha), 2)
+	offset := int(16 * float64(b.dpi) / 96)
+	y := b.baseY
+	if b.anim.kind == animEnter {
+		y += int(float64(offset) * (1 - value))
+	} else {
+		y += int(float64(offset) * value)
+	}
+	procSetWindowPos.Call(b.hwnd, 0, uintptr(b.baseX), uintptr(y), 0, 0, swpNoZOrder|swpNoActivate|swpNoSize)
+	if done {
+		procKillTimer.Call(b.hwnd, 2)
+		b.animTimer = false
+		if b.anim.kind == animExit {
+			b.anim.stop()
+			procShowWindow.Call(b.hwnd, swHide)
+			b.visible.Store(false)
+		} else {
+			b.anim.stop()
+			b.alpha = 255
+			procSetLayeredWindowAttributes.Call(b.hwnd, 0, 255, 2)
+			procSetWindowPos.Call(b.hwnd, 0, uintptr(b.baseX), uintptr(b.baseY), 0, 0, swpNoZOrder|swpNoActivate|swpNoSize)
+		}
+	}
 }
 
 func (b *winBackend) refreshOnGUI(items []pendingItem) {
@@ -442,8 +526,31 @@ func (b *winBackend) refreshOnGUI(items []pendingItem) {
 	procInvalidateRect.Call(b.hwnd, 0, 0)
 }
 
+func (b *winBackend) applyAutoCloseTimer() {
+	if b.hwnd == 0 {
+		return
+	}
+	if b.visible.Load() && b.autoClose.Load() > 0 {
+		procSetTimer.Call(b.hwnd, 1, 1000, 0)
+	} else {
+		procKillTimer.Call(b.hwnd, 1)
+	}
+}
+
 func (b *winBackend) hideOnGUI() {
+	if b.visible.Load() && b.animations && systemAnimationsEnabled() && b.anim.kind != animExit {
+		procKillTimer.Call(b.hwnd, 1)
+		b.anim.begin(animExit, time.Now(), 120*time.Millisecond, float64(b.alpha)/255, 0)
+		b.ensureAnimationTimer()
+		return
+	}
 	if b.hwnd != 0 {
+		procKillTimer.Call(b.hwnd, 1)
+		procKillTimer.Call(b.hwnd, 2)
+		b.anim.stop()
+		b.animTimer = false
+		b.alpha = 255
+		procSetLayeredWindowAttributes.Call(b.hwnd, 0, 255, 2)
 		procShowWindow.Call(b.hwnd, swHide)
 	}
 	b.visible.Store(false)
@@ -694,6 +801,24 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 	case wmMouseMove, wmLButtonDown, wmLButtonUp, wmKeyDown, wmMouseWheel, wmVScroll, wmCommand:
 		if b.visible.Load() {
 			b.lastActivity = time.Now()
+		}
+	}
+	switch message {
+	case wmAppCommand:
+		b.drainCommands()
+		return 0
+	case wmTimer:
+		if wParam == 2 {
+			b.stepAnimation()
+			return 0
+		}
+		if wParam == 1 && autoCloseDue(b.visible.Load(), int(b.autoClose.Load()), time.Since(b.lastActivity)) {
+			b.hideOnGUI()
+		}
+		return 0
+	case wmPowerBroadcast, wmTimeChange:
+		if b.callbacks.Wake != nil {
+			b.callbacks.Wake()
 		}
 	}
 	switch message {
