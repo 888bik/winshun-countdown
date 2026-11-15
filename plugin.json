@@ -1,0 +1,88 @@
+{
+  "$schema": "https://raw.githubusercontent.com/LingCore/WinShun-plugins/main/schema/plugin.schema.json",
+  "manifest": 1,
+  "id": "me.countdown",
+  "name": {
+    "zh": "倒计时",
+    "en": "Countdown"
+  },
+  "version": "1.3.0",
+  "description": {
+    "zh": "原生 Go 版倒计时，无需安装 Python。支持多个计时器，到期后需确认并持续提醒。",
+    "en": "Native Go countdown timers. Multiple timers, acknowledgement pending state, and repeated reminders until confirmed."
+  },
+  "author": "888bik",
+  "homepage": "https://github.com/888bik/winshun-countdown",
+  "license": "MIT",
+  "minWinShun": "0.22.0",
+  "runtime": {
+    "mode": "resident",
+    "program": "countdown.exe",
+    "memoryMB": 64,
+    "debounceMs": 120,
+    "start": "eager",
+    "idleExitSec": 0
+  },
+  "permissions": [
+    "notifications",
+    "ui"
+  ],
+  "settings": [
+    {
+      "key": "floating_window",
+      "type": "bool",
+      "title": {
+        "zh": "到期弹出悬浮窗",
+        "en": "Show floating acknowledgement window"
+      },
+      "default": true
+    },
+    {
+      "key": "auto_close_seconds",
+      "type": "number",
+      "title": {
+        "zh": "悬浮窗自动关闭（秒，0 = 不自动关闭）",
+        "en": "Auto-close floating window (seconds, 0 = never)"
+      },
+      "default": 0
+    },
+    {
+      "key": "snooze_minutes",
+      "type": "number",
+      "title": {
+        "zh": "稍后提醒默认时长（分钟）",
+        "en": "Default snooze (minutes)"
+      },
+      "default": 5
+    },
+    {
+      "key": "repeat_first_seconds",
+      "type": "number",
+      "title": {
+        "zh": "到期后第一次重复提醒（秒）",
+        "en": "First repeated reminder after expiry (seconds)"
+      },
+      "default": 15
+    },
+    {
+      "key": "repeat_every_seconds",
+      "type": "number",
+      "title": {
+        "zh": "之后每次重复提醒的间隔（秒）",
+        "en": "Interval between later repeated reminders (seconds)"
+      },
+      "default": 60
+    }
+  ],
+  "commands": [
+    {
+      "id": "countdown",
+      "keyword": "倒计时",
+      "title": {
+        "zh": "倒计时",
+        "en": "Countdown"
+      },
+      "hint": "输入标题和时长，例如 泡面 3"
+    }
+  ]
+}
