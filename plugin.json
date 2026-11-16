@@ -6,7 +6,7 @@
     "zh": "倒计时",
     "en": "Countdown"
   },
-  "version": "1.6.1",
+  "version": "1.7.0",
   "description": {
     "zh": "原生 Go 版倒计时，无需安装 Python。支持多个计时器，到期后需确认并持续提醒。",
     "en": "Native Go countdown timers. Multiple timers, acknowledgement pending state, and repeated reminders until confirmed."

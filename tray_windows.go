@@ -191,12 +191,14 @@ type winTrayBackend struct {
 	pendingCmds []winTrayCommand
 
 	// The following fields are owned by the tray GUI thread.
-	enabled    bool
-	iconAdded  bool
-	icon       uintptr
-	ownedIcon  bool
-	taskbarMsg uint32
-	items      []trayTimerSnapshot
+	enabled              bool
+	iconAdded            bool
+	icon                 uintptr
+	ownedIcon            bool
+	iconMinuteValue      string
+	iconValueInitialized bool
+	taskbarMsg           uint32
+	items                []trayTimerSnapshot
 }
 
 func newTrayBackend(callbacks trayCallbacks) trayBackend {
@@ -385,6 +387,9 @@ func (b *winTrayBackend) loop() {
 		trayProcDestroyIcon.Call(b.icon)
 	}
 	b.icon = 0
+	b.ownedIcon = false
+	b.iconMinuteValue = ""
+	b.iconValueInitialized = false
 }
 
 func (b *winTrayBackend) drainCommands() {
@@ -466,10 +471,19 @@ func (b *winTrayBackend) addOrModifyIconOnGUI() {
 	if !b.enabled {
 		return
 	}
-	if b.icon == 0 {
-		b.icon, b.ownedIcon = createCountdownTrayIcon()
+	desiredMinuteValue := trayIconMinuteValue(b.items)
+	rebuildIcon := b.icon == 0 || trayIconValueChanged(b.iconMinuteValue, b.iconValueInitialized, desiredMinuteValue)
+	nextIcon := b.icon
+	nextOwned := b.ownedIcon
+	if rebuildIcon {
+		nextIcon, nextOwned = createCountdownTrayIcon(desiredMinuteValue)
+		if nextIcon == 0 {
+			fmt.Fprintln(os.Stderr, "me.countdown: unable to create tray icon")
+			return
+		}
 	}
 	data := b.notifyData()
+	data.hIcon = nextIcon
 	operation := uintptr(trayNIMModify)
 	if !b.iconAdded {
 		operation = trayNIMAdd
@@ -483,8 +497,20 @@ func (b *winTrayBackend) addOrModifyIconOnGUI() {
 		runtime.KeepAlive(&data)
 	}
 	if result == 0 {
+		if rebuildIcon && nextOwned {
+			trayProcDestroyIcon.Call(nextIcon)
+		}
 		fmt.Fprintf(os.Stderr, "me.countdown: Shell_NotifyIconW add/modify failed: %v\n", callErr)
 		return
+	}
+	if rebuildIcon {
+		if shouldDestroyOwnedTrayIcon(b.icon, b.ownedIcon, nextIcon) {
+			trayProcDestroyIcon.Call(b.icon)
+		}
+		b.icon = nextIcon
+		b.ownedIcon = nextOwned
+		b.iconMinuteValue = desiredMinuteValue
+		b.iconValueInitialized = true
 	}
 	b.iconAdded = true
 }
@@ -608,7 +634,7 @@ func (b *winTrayBackend) appendMenuItem(menu uintptr, item trayMenuItem) bool {
 	return result != 0
 }
 
-func createCountdownTrayIcon() (uintptr, bool) {
+func createCountdownTrayIcon(minuteValue string) (uintptr, bool) {
 	width, _, _ := trayProcGetSystemMetrics.Call(traySMCXSmIcon)
 	height, _, _ := trayProcGetSystemMetrics.Call(traySMCYSmIcon)
 	if width == 0 {
@@ -617,7 +643,7 @@ func createCountdownTrayIcon() (uintptr, bool) {
 	if height == 0 {
 		height = 16
 	}
-	icon, err := createClockIcon(int(width), int(height))
+	icon, err := createClockIconWithLabel(int(width), int(height), minuteValue)
 	if err == nil && icon != 0 {
 		return icon, true
 	}
@@ -626,6 +652,10 @@ func createCountdownTrayIcon() (uintptr, bool) {
 }
 
 func createClockIcon(width, height int) (uintptr, error) {
+	return createClockIconWithLabel(width, height, "")
+}
+
+func createClockIconWithLabel(width, height int, minuteValue string) (uintptr, error) {
 	if width < 8 || height < 8 || width > 128 || height > 128 {
 		return 0, fmt.Errorf("unsupported tray icon size %dx%d", width, height)
 	}
@@ -677,9 +707,13 @@ func createClockIcon(width, height int) (uintptr, error) {
 			}
 		}
 	}
-	drawTrayLine(pixels, width, centerX, centerY, centerX, centerY-radius*3/4, white)
-	drawTrayLine(pixels, width, centerX, centerY, centerX+radius*3/5, centerY+radius/3, white)
-	setTrayPixel(pixels, width, centerX, centerY, white)
+	if minuteValue == "" {
+		drawTrayLine(pixels, width, centerX, centerY, centerX, centerY-radius*3/4, white)
+		drawTrayLine(pixels, width, centerX, centerY, centerX+radius*3/5, centerY+radius/3, white)
+		setTrayPixel(pixels, width, centerX, centerY, white)
+	} else {
+		drawTrayMinuteLabel(pixels, width, height, minuteValue, white)
+	}
 
 	iconInfo := trayIconInfo{
 		fIcon:    1,
@@ -693,6 +727,58 @@ func createClockIcon(width, height int) (uintptr, error) {
 		return 0, fmt.Errorf("CreateIconIndirect failed: %v", iconErr)
 	}
 	return icon, nil
+}
+
+func drawTrayMinuteLabel(pixels []byte, width, height int, label string, color [4]byte) {
+	glyphs := map[rune][5]uint8{
+		'0': {0b111, 0b101, 0b101, 0b101, 0b111},
+		'1': {0b010, 0b110, 0b010, 0b010, 0b111},
+		'2': {0b111, 0b001, 0b111, 0b100, 0b111},
+		'3': {0b111, 0b001, 0b111, 0b001, 0b111},
+		'4': {0b101, 0b101, 0b111, 0b001, 0b001},
+		'5': {0b111, 0b100, 0b111, 0b001, 0b111},
+		'6': {0b111, 0b100, 0b111, 0b101, 0b111},
+		'7': {0b111, 0b001, 0b010, 0b010, 0b010},
+		'8': {0b111, 0b101, 0b111, 0b101, 0b111},
+		'9': {0b111, 0b101, 0b111, 0b001, 0b111},
+		'+': {0b000, 0b010, 0b111, 0b010, 0b000},
+	}
+	characters := []rune(label)
+	if len(characters) == 0 {
+		return
+	}
+	scale := minInt(width, height) / 16
+	if scale < 1 {
+		scale = 1
+	}
+	spacing := scale
+	glyphWidth := 3 * scale
+	glyphHeight := 5 * scale
+	totalWidth := len(characters)*glyphWidth + (len(characters)-1)*spacing
+	if totalWidth > width-2 {
+		return
+	}
+	startX := (width - totalWidth) / 2
+	startY := (height - glyphHeight) / 2
+	for index, character := range characters {
+		pattern, ok := glyphs[character]
+		if !ok {
+			continue
+		}
+		baseX := startX + index*(glyphWidth+spacing)
+		for row, bits := range pattern {
+			for column := 0; column < 3; column++ {
+				if bits&(1<<uint(2-column)) == 0 {
+					continue
+				}
+				for dy := 0; dy < scale; dy++ {
+					for dx := 0; dx < scale; dx++ {
+						setTrayPixel(pixels, width, baseX+column*scale+dx, startY+row*scale+dy, color)
+					}
+				}
+			}
+		}
+	}
 }
 
 func minInt(left, right int) int {

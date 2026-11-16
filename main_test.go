@@ -89,7 +89,7 @@ func testPlugin(t *testing.T, now time.Time) (*Plugin, *bytes.Buffer, string) {
 	p := newPlugin(out, dir, func() time.Time { return now }, nil)
 	p.sound = &fakeSound{}
 	p.window = &fakeWindow{showOK: true}
-	p.tray = &fakeTrayBackend{}
+	p.tray = &fakeTrayBackend{iconOwned: true, nextIconHandle: 1}
 	p.settings["floating_window"] = false
 	return p, out, dir
 }
@@ -150,7 +150,7 @@ func TestCreateListCancelAndExpire(t *testing.T) {
 	p.startTimer("午休", 600)
 
 	items, rerun := p.query("")
-	if rerun != 1 || len(items) != 2 {
+	if rerun != 1 || len(items) != 11 {
 		t.Fatalf("list = %d items rerun=%d", len(items), rerun)
 	}
 	if items[0]["title"] != "泡面" {
@@ -181,8 +181,8 @@ func TestCreateListCancelAndExpire(t *testing.T) {
 		t.Fatalf("expiry notify missing: %s", out.String())
 	}
 	items, _ = p.query("")
-	if len(items) != 1 || !strings.Contains(items[0]["subtitle"].(string), "等待确认") {
-		t.Fatalf("pending list: %#v", items)
+	if len(items) != 10 || !strings.Contains(items[0]["subtitle"].(string), "等待确认") {
+		t.Fatalf("pending list plus presets: %#v", items)
 	}
 	result := p.doAction(actionData{Type: "acknowledge", TimerID: expired.ID})
 	encoded, _ := json.Marshal(result)
@@ -295,7 +295,7 @@ func TestPendingListOrderAndQueryDoesNotMutate(t *testing.T) {
 
 	before := p.timerListLocked()
 	items, rerun := p.query("")
-	if rerun != 1 || len(items) != 2 {
+	if rerun != 1 || len(items) != 11 {
 		t.Fatalf("list: %d rerun=%d", len(items), rerun)
 	}
 	if items[0]["title"] != "泡面" || !strings.Contains(items[0]["subtitle"].(string), "等待确认") {
@@ -841,8 +841,8 @@ func TestSnoozeReturnsToRunning(t *testing.T) {
 		t.Fatalf("snooze reminder state: %#v", item)
 	}
 	items, _ := p.query("")
-	if len(items) != 1 || !strings.Contains(items[0]["subtitle"].(string), "剩余 05:00") {
-		t.Fatalf("snoozed list: %#v", items)
+	if len(items) != 10 || !strings.Contains(items[0]["subtitle"].(string), "剩余 05:00") {
+		t.Fatalf("snoozed list plus presets: %#v", items)
 	}
 }
 
@@ -1065,7 +1065,7 @@ func TestTrayTooltipTextStates(t *testing.T) {
 				{ID: "a", Status: statusRunning, RemainingSeconds: 150, EndsAt: base.Add(150 * time.Second)},
 				{ID: "b", Status: statusPending, EndedAt: base},
 			},
-			want: "倒计时：1 个在跑 · 1 个待确认",
+			want: "倒计时：1 个在跑，最近 02:30 后到期 · 1 个待确认",
 		},
 		{
 			name: "empty",
@@ -1479,15 +1479,23 @@ func TestProtocolSmokeWithBuiltBinary(t *testing.T) {
 }
 
 type fakeTrayBackend struct {
-	mu            sync.Mutex
-	enabled       bool
-	addCalls      int
-	modifyCalls   int
-	deleteCalls   int
-	taskbarReadds int
-	closeCalls    int
-	lastItems     []trayTimerSnapshot
-	setCalls      []bool
+	mu                   sync.Mutex
+	enabled              bool
+	addCalls             int
+	modifyCalls          int
+	deleteCalls          int
+	taskbarReadds        int
+	closeCalls           int
+	lastItems            []trayTimerSnapshot
+	setCalls             []bool
+	updates              int
+	iconValue            string
+	iconValueInitialized bool
+	iconRebuilds         int
+	destroyedOwnedIcons  int
+	iconHandle           uintptr
+	iconOwned            bool
+	nextIconHandle       uintptr
 }
 
 func (f *fakeTrayBackend) SetEnabled(enabled bool) {
@@ -1507,8 +1515,25 @@ func (f *fakeTrayBackend) Update(items []trayTimerSnapshot) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastItems = append([]trayTimerSnapshot(nil), items...)
+	f.updates++
 	if f.enabled {
 		f.modifyCalls++
+		value := trayIconMinuteValue(items)
+		if trayIconValueChanged(f.iconValue, f.iconValueInitialized, value) {
+			nextHandle := f.nextIconHandle
+			if nextHandle == 0 {
+				nextHandle = 1
+			}
+			if shouldDestroyOwnedTrayIcon(f.iconHandle, f.iconOwned, nextHandle) {
+				f.destroyedOwnedIcons++
+			}
+			f.iconHandle = nextHandle
+			f.nextIconHandle = nextHandle + 1
+			f.iconOwned = true
+			f.iconValue = value
+			f.iconValueInitialized = true
+			f.iconRebuilds++
+		}
 	}
 }
 
@@ -1570,6 +1595,394 @@ func (f *fakeSound) snapshot() (files []string, defaults, stops int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.files...), f.defaultPlays, f.stops
+}
+
+func TestPresetRowsAndListComposition(t *testing.T) {
+	p, _, _ := testPlugin(t, fixedNow())
+	items, rerun := p.query("")
+	if rerun != 0 || len(items) != 9 {
+		t.Fatalf("empty list = %d presets, rerun=%d", len(items), rerun)
+	}
+	want := []durationPreset{
+		{Title: "5 分钟", Seconds: 300},
+		{Title: "10 分钟", Seconds: 600},
+		{Title: "15 分钟", Seconds: 900},
+		{Title: "25 分钟", Seconds: 1500},
+		{Title: "30 分钟", Seconds: 1800},
+		{Title: "45 分钟", Seconds: 2700},
+		{Title: "60 分钟", Seconds: 3600},
+		{Title: "番茄专注", Seconds: 1500},
+		{Title: "休息", Seconds: 300},
+	}
+	for index, preset := range want {
+		row := items[index]
+		if row["title"] != preset.Title || row["subtitle"] != humanDuration(preset.Seconds)+" · Enter 开始" {
+			t.Fatalf("preset row %d = %#v", index, row)
+		}
+		data := row["data"].(map[string]any)
+		if data["type"] != "start" || data["title"] != preset.Title || data["seconds"] != preset.Seconds {
+			t.Fatalf("preset data %d = %#v", index, data)
+		}
+		actions := row["actions"].([]map[string]any)
+		if len(actions) != 1 || actions[0]["id"] != "start" || actions[0]["key"] != "Enter" {
+			t.Fatalf("preset actions %d = %#v", index, actions)
+		}
+	}
+
+	p.startTimer("已有计时器", 120)
+	items, rerun = p.query("")
+	if rerun != 1 || len(items) != 10 || items[0]["title"] != "已有计时器" || items[1]["title"] != "5 分钟" {
+		t.Fatalf("existing timer/preset order = %#v rerun=%d", items, rerun)
+	}
+
+	manual, manualRerun := p.query("手动任务 3")
+	if manualRerun != 0 || len(manual) != 1 || manual[0]["title"] != "开始倒计时：手动任务" {
+		t.Fatalf("manual input should not include presets: %#v rerun=%d", manual, manualRerun)
+	}
+}
+
+func TestPresetStartRespectsRunningLimit(t *testing.T) {
+	p, _, _ := testPlugin(t, fixedNow())
+	p.settings["sound_enabled"] = false
+	for index := 0; index < maxTimers; index++ {
+		p.startTimer(fmt.Sprintf("任务%d", index), 600)
+	}
+	items, _ := p.query("")
+	preset := items[len(items)-9]
+	data := preset["data"].(map[string]any)
+	result := p.doActionNamed(actionData{
+		Title: data["title"].(string), Seconds: data["seconds"].(int64),
+	}, "start")
+	encoded, _ := json.Marshal(result)
+	if !strings.Contains(string(encoded), "最多同时运行 20 个倒计时") {
+		t.Fatalf("preset action did not respect running limit: %s", encoded)
+	}
+}
+
+func TestRunningSubtitleShowsLocalEndTimeOnly(t *testing.T) {
+	now := fixedNow()
+	running := &timer{ID: "running", Title: "运行中", EndsAt: now.Add(1500 * time.Second)}
+	runningView := runningItemView(running, now)
+	wantEnd := running.EndsAt.Format("15:04") + " 结束 · Enter 取消"
+	if !strings.Contains(runningView["subtitle"].(string), wantEnd) {
+		t.Fatalf("running subtitle = %q, want ending %q", runningView["subtitle"], wantEnd)
+	}
+	pausedView := pausedItemView(&timer{ID: "paused", Title: "暂停", Status: statusPaused, RemainingSeconds: 60})
+	if strings.Contains(pausedView["subtitle"].(string), "结束 ·") || strings.Contains(pausedView["subtitle"].(string), now.Format("15:04")) {
+		t.Fatalf("paused subtitle should not show an end time: %q", pausedView["subtitle"])
+	}
+	pendingView := pendingItemView(&timer{ID: "pending", Title: "待确认", Status: statusPending})
+	if strings.Contains(pendingView["subtitle"].(string), now.Format("15:04")) {
+		t.Fatalf("pending subtitle should not show an end time: %q", pendingView["subtitle"])
+	}
+}
+
+func TestTrayIconMinuteValueRoundsAndUsesEarliestRunningTimer(t *testing.T) {
+	base := fixedNow()
+	tests := []struct {
+		name  string
+		items []trayTimerSnapshot
+		want  string
+	}{
+		{name: "59 seconds rounds to one", items: []trayTimerSnapshot{{ID: "a", Status: statusRunning, RemainingSeconds: 59, EndsAt: base.Add(time.Second)}}, want: "1"},
+		{name: "61 seconds rounds to two", items: []trayTimerSnapshot{{ID: "a", Status: statusRunning, RemainingSeconds: 61, EndsAt: base.Add(time.Second)}}, want: "2"},
+		{name: "25 minutes", items: []trayTimerSnapshot{{ID: "a", Status: statusRunning, RemainingSeconds: 1500, EndsAt: base.Add(time.Second)}}, want: "25"},
+		{name: "over 99 minutes", items: []trayTimerSnapshot{{ID: "a", Status: statusRunning, RemainingSeconds: 5941, EndsAt: base.Add(time.Second)}}, want: "99+"},
+		{name: "paused only", items: []trayTimerSnapshot{{ID: "a", Status: statusPaused, RemainingSeconds: 59}}, want: ""},
+		{name: "pending only", items: []trayTimerSnapshot{{ID: "a", Status: statusPending, RemainingSeconds: 59}}, want: ""},
+		{name: "empty", want: ""},
+		{
+			name: "earliest ending timer wins",
+			items: []trayTimerSnapshot{
+				{ID: "later", Status: statusRunning, RemainingSeconds: 600, EndsAt: base.Add(10 * time.Minute)},
+				{ID: "earlier", Status: statusRunning, RemainingSeconds: 61, EndsAt: base.Add(time.Minute)},
+			},
+			want: "2",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := trayIconMinuteValue(tc.items); got != tc.want {
+				t.Fatalf("tray icon value = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTrayIconRebuildCacheAndOwnedIconCleanupRules(t *testing.T) {
+	p, _, _ := testPlugin(t, fixedNow())
+	current := fixedNow()
+	p.now = func() time.Time { return current }
+	fake := p.tray.(*fakeTrayBackend)
+	p.settings["tray_icon"] = true
+	p.applyTraySettings()
+	p.startTimer("托盘数字", 1500)
+
+	fake.mu.Lock()
+	initialRebuilds := fake.iconRebuilds
+	fake.mu.Unlock()
+	p.refreshTray()
+	fake.mu.Lock()
+	unchangedRebuilds := fake.iconRebuilds
+	fake.mu.Unlock()
+	if unchangedRebuilds != initialRebuilds {
+		t.Fatalf("unchanged icon value rebuilt: before=%d after=%d", initialRebuilds, unchangedRebuilds)
+	}
+
+	current = current.Add(time.Minute)
+	p.refreshTray()
+	fake.mu.Lock()
+	changedRebuilds := fake.iconRebuilds
+	destroyedOwned := fake.destroyedOwnedIcons
+	fake.iconOwned = false // Model an IDI_APPLICATION fallback as the old icon.
+	fake.mu.Unlock()
+	if changedRebuilds != initialRebuilds+1 || destroyedOwned == 0 {
+		t.Fatalf("changed value did not rebuild/destroy owned icon: rebuilds=%d destroyed=%d", changedRebuilds, destroyedOwned)
+	}
+	current = current.Add(time.Minute)
+	p.refreshTray()
+	fake.mu.Lock()
+	destroyedAfterFallback := fake.destroyedOwnedIcons
+	fake.mu.Unlock()
+	if destroyedAfterFallback != destroyedOwned {
+		t.Fatalf("fallback icon must not be destroyed: before=%d after=%d", destroyedOwned, destroyedAfterFallback)
+	}
+	if !shouldDestroyOwnedTrayIcon(1, true, 2) || shouldDestroyOwnedTrayIcon(1, false, 2) || shouldDestroyOwnedTrayIcon(1, true, 1) {
+		t.Fatal("owned/fallback icon destruction predicate is incorrect")
+	}
+}
+
+func TestSchedulerWakeRefreshesTrayWhenNothingIsDue(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	fake := p.tray.(*fakeTrayBackend)
+	p.settings["tray_icon"] = true
+	p.applyTraySettings()
+	p.startTimer("动态分钟", 180)
+	fake.mu.Lock()
+	initialUpdates := fake.updates
+	initialValue := fake.iconValue
+	fake.mu.Unlock()
+	if initialValue != "3" {
+		t.Fatalf("initial tray minute = %q, want 3", initialValue)
+	}
+
+	current = current.Add(31 * time.Second)
+	p.handleSchedulerWake(current)
+	fake.mu.Lock()
+	firstUpdates := fake.updates
+	firstValue := fake.iconValue
+	fake.mu.Unlock()
+	if firstUpdates <= initialUpdates || firstValue != "3" {
+		t.Fatalf("scheduler wake did not refresh tray snapshot: updates %d->%d value=%q", initialUpdates, firstUpdates, firstValue)
+	}
+
+	current = current.Add(31 * time.Second)
+	p.handleSchedulerWake(current)
+	fake.mu.Lock()
+	secondValue := fake.iconValue
+	secondItems := append([]trayTimerSnapshot(nil), fake.lastItems...)
+	fake.mu.Unlock()
+	if secondValue != "2" || len(secondItems) != 1 || secondItems[0].RemainingSeconds != 118 {
+		t.Fatalf("tray minute did not follow elapsed time: value=%q items=%#v", secondValue, secondItems)
+	}
+}
+
+func TestPreReminderSchedulesAtOneMinuteBeforeEndAndToastsOnce(t *testing.T) {
+	current := fixedNow()
+	p, out, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	p.settings["sound_enabled"] = true
+	p.settings["floating_window"] = true
+	fakeSound := &fakeSound{}
+	p.sound = fakeSound
+	p.startTimer("番茄专注", 25*60)
+	out.Reset()
+	id := p.timerListLocked()[0].ID
+
+	current = current.Add(25*time.Minute - time.Minute - time.Second)
+	p.mu.Lock()
+	delay, ok := p.nextWakeDelayLocked(current)
+	p.mu.Unlock()
+	if !ok || delay != time.Second {
+		t.Fatalf("pre-reminder scheduler delay = %v, ok=%v; want 1s", delay, ok)
+	}
+	current = current.Add(time.Second)
+	if !p.processDue(current) {
+		t.Fatal("pre-reminder deadline was not processed")
+	}
+	if got := notificationCount(out.String()); got != 1 || !strings.Contains(out.String(), "还有 1 分钟到期：番茄专注") {
+		t.Fatalf("pre-reminder toast = %d notifications: %s", got, out.String())
+	}
+	if p.timers[id].Status != statusRunning || !p.timers[id].PreReminded {
+		t.Fatalf("pre-reminder changed timer state incorrectly: %+v", p.timers[id])
+	}
+	_, defaultPlays, _ := fakeSound.snapshot()
+	if defaultPlays != 0 {
+		t.Fatalf("pre-reminder must not play sound, got %d", defaultPlays)
+	}
+	visible, _ := p.window.(*fakeWindow).snapshot()
+	if visible {
+		t.Fatal("pre-reminder must not show the floating acknowledgement window")
+	}
+	out.Reset()
+	p.processDue(current.Add(time.Second))
+	if notificationCount(out.String()) != 0 {
+		t.Fatalf("pre-reminder was sent more than once: %s", out.String())
+	}
+}
+
+func TestPreReminderNeverFiresForSixtySecondsOrLess(t *testing.T) {
+	current := fixedNow()
+	p, out, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	p.settings["sound_enabled"] = false
+	for _, seconds := range []int64{1, 60} {
+		out.Reset()
+		p.timers = map[string]*timer{}
+		p.startTimer(fmt.Sprintf("%d 秒", seconds), seconds)
+		id := p.timerListLocked()[0].ID
+		p.processDue(current.Add(time.Duration(maxInt64(0, seconds-1)) * time.Second))
+		if p.timers[id] == nil || p.timers[id].PreReminded {
+			t.Fatalf("%d-second timer unexpectedly pre-reminded: %#v", seconds, p.timers[id])
+		}
+		if strings.Contains(out.String(), "还有 1 分钟到期") {
+			t.Fatalf("%d-second timer emitted pre-reminder: %s", seconds, out.String())
+		}
+	}
+}
+
+func TestRestartResetsPreReminderButResumePreservesIt(t *testing.T) {
+	current := fixedNow()
+	p, out, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	p.settings["sound_enabled"] = false
+	p.startTimer("重新运行", 1500)
+	id := p.timerListLocked()[0].ID
+	p.processDue(current.Add(24 * time.Minute))
+	if !p.timers[id].PreReminded {
+		t.Fatal("pre-reminder flag was not set")
+	}
+	p.restartTimer(id)
+	if p.timers[id].PreReminded {
+		t.Fatal("restart must reset PreReminded")
+	}
+	current = current.Add(24 * time.Minute)
+	out.Reset()
+	p.processDue(current)
+	if !p.timers[id].PreReminded || !strings.Contains(out.String(), "还有 1 分钟到期：重新运行") {
+		t.Fatalf("restarted timer did not emit a new pre-reminder: timer=%+v output=%s", p.timers[id], out.String())
+	}
+	p.pauseTimer(id)
+	if !p.timers[id].PreReminded {
+		t.Fatal("pause must preserve PreReminded")
+	}
+	current = current.Add(time.Minute)
+	p.resumeTimer(id)
+	if !p.timers[id].PreReminded {
+		t.Fatal("resume must preserve PreReminded")
+	}
+}
+
+func TestPausedTimerSkipsPreReminderAndResumeSchedulesItAgain(t *testing.T) {
+	current := fixedNow()
+	p, out, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	p.settings["sound_enabled"] = false
+	p.startTimer("暂停测试", 25*60)
+	id := p.timerListLocked()[0].ID
+
+	current = current.Add(10 * time.Minute)
+	p.pauseTimer(id)
+	if delay, ok := p.nextWakeDelayLocked(current); ok {
+		t.Fatalf("paused timer should not schedule a pre-reminder: delay=%v", delay)
+	}
+	out.Reset()
+	p.processDue(current.Add(20 * time.Minute))
+	if strings.Contains(out.String(), "还有 1 分钟到期") || p.timers[id].PreReminded {
+		t.Fatalf("paused timer pre-reminded: output=%s timer=%+v", out.String(), p.timers[id])
+	}
+
+	current = current.Add(20 * time.Minute)
+	p.resumeTimer(id)
+	remaining := p.timers[id].EndsAt.Sub(current)
+	if remaining <= time.Minute {
+		t.Fatalf("test setup expected more than one minute remaining, got %v", remaining)
+	}
+	out.Reset()
+	p.processDue(p.timers[id].EndsAt.Add(-time.Minute))
+	if !p.timers[id].PreReminded || !strings.Contains(out.String(), "还有 1 分钟到期：暂停测试") {
+		t.Fatalf("resumed timer did not receive pre-reminder: timer=%+v output=%s", p.timers[id], out.String())
+	}
+}
+
+func TestPreReminderPersistsAcrossRestart(t *testing.T) {
+	current := fixedNow()
+	p, _, dir := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	p.settings["sound_enabled"] = false
+	p.startTimer("持久化提醒", 1500)
+	id := p.timerListLocked()[0].ID
+	p.processDue(current.Add(24 * time.Minute))
+	if !p.timers[id].PreReminded {
+		t.Fatal("setup did not set pre-reminded flag")
+	}
+
+	out := &bytes.Buffer{}
+	restored := newPlugin(out, dir, func() time.Time { return current.Add(24 * time.Minute) }, nil)
+	restored.settings["floating_window"] = false
+	restored.settings["sound_enabled"] = false
+	restored.load()
+	if restored.timers[id] == nil || !restored.timers[id].PreReminded {
+		t.Fatalf("pre-reminded state not restored: %#v", restored.timers[id])
+	}
+	restored.processDue(current.Add(24*time.Minute + time.Second))
+	if strings.Contains(out.String(), "还有 1 分钟到期") {
+		t.Fatalf("restored timer emitted duplicate pre-reminder: %s", out.String())
+	}
+}
+
+func TestV2RecordWithoutPreRemindedDefaultsFalse(t *testing.T) {
+	current := fixedNow()
+	dir := t.TempDir()
+	doc := storedFile{Version: dataVersion, Timers: []storedTimer{
+		{
+			ID: "legacy-v2", Title: "旧版计时器",
+			CreatedAt: current.Format(time.RFC3339Nano),
+			EndsAt:    current.Add(120 * time.Second).Format(time.RFC3339Nano),
+			Status:    statusRunning, OriginalSeconds: 120,
+		},
+	}}
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, dataFileName), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := newPlugin(&bytes.Buffer{}, dir, func() time.Time { return current }, nil)
+	p.load()
+	item := p.timers["legacy-v2"]
+	if item == nil {
+		t.Fatal("legacy v2 timer was not restored")
+	}
+	if item.PreReminded {
+		t.Fatal("missing preReminded field must default to false")
+	}
+	p.mu.Lock()
+	delay, ok := p.nextWakeDelayLocked(current)
+	p.mu.Unlock()
+	if !ok || delay != 30*time.Second {
+		t.Fatalf("legacy v2 timer pre-reminder delay = %v, ok=%v; want 30s scheduler cap", delay, ok)
+	}
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func TestPauseResumeLifecycleAndScheduler(t *testing.T) {
@@ -1678,8 +2091,8 @@ func TestPausedListSortsByRemainingSeconds(t *testing.T) {
 	p.pauseTimer(ids["剩余较少"])
 
 	items, _ := p.query("")
-	if len(items) != 2 || items[0]["title"] != "剩余较少" || items[1]["title"] != "剩余较多" {
-		t.Fatalf("paused list order: %#v", items)
+	if len(items) != 11 || items[0]["title"] != "剩余较少" || items[1]["title"] != "剩余较多" {
+		t.Fatalf("paused list order and trailing presets: %#v", items)
 	}
 }
 
