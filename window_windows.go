@@ -138,6 +138,8 @@ var (
 	procPostMessageW                 = user32.NewProc("PostMessageW")
 	procSetTimer                     = user32.NewProc("SetTimer")
 	procKillTimer                    = user32.NewProc("KillTimer")
+	procTimeBeginPeriod              = winmm.NewProc("timeBeginPeriod")
+	procTimeEndPeriod                = winmm.NewProc("timeEndPeriod")
 	procSetLayeredWindowAttributes   = user32.NewProc("SetLayeredWindowAttributes")
 	procSystemParametersInfoW        = user32.NewProc("SystemParametersInfoW")
 	procPeekMessageW                 = user32.NewProc("PeekMessageW")
@@ -200,16 +202,17 @@ type winBackend struct {
 	cmdMu       sync.Mutex
 	pendingCmds []winCommand
 
-	visible      atomic.Bool
-	autoClose    atomic.Int64
-	lastActivity time.Time
-	animations   bool
-	popupCenter  bool
-	alpha        int
-	anim         animation
-	animTimer    bool
-	baseX        int
-	baseY        int
+	visible         atomic.Bool
+	autoClose       atomic.Int64
+	lastActivity    time.Time
+	animations      bool
+	popupCenter     bool
+	alpha           int
+	anim            animation
+	animTimer       bool
+	timerResolution bool
+	baseX           int
+	baseY           int
 
 	// The fields below are owned by the GUI thread after create.
 	hwnd            uintptr
@@ -263,6 +266,9 @@ func (b *winBackend) drainCommands() {
 			b.applyAutoCloseTimer()
 		case winAnimations:
 			b.animations = command.animations
+			if !command.animations && b.anim.kind != animNone {
+				b.finishAnimationImmediately()
+			}
 		case winPopupCenter:
 			b.popupCenter = command.center
 			if b.hwnd != 0 && b.visible.Load() {
@@ -464,10 +470,10 @@ func (b *winBackend) showOnGUI(items []pendingItem) {
 		b.alpha = 0
 		procSetLayeredWindowAttributes.Call(b.hwnd, 0, 0, 2)
 		procSetWindowPos.Call(b.hwnd, 0, uintptr(b.baseX), uintptr(b.baseY+int(16*float64(b.dpi)/96)), 0, 0, swpNoZOrder|swpNoActivate|swpNoSize)
-		b.anim.begin(animEnter, time.Now(), 180*time.Millisecond, 0, 1)
+		b.anim.begin(animEnter, time.Now(), animationEnterDuration, 0, 1)
 		b.ensureAnimationTimer()
 	} else if b.anim.kind == animExit {
-		b.anim.begin(animEnter, time.Now(), 180*time.Millisecond, float64(b.alpha)/255, 1)
+		b.anim.begin(animEnter, time.Now(), animationEnterDuration, float64(b.alpha)/255, 1)
 		b.ensureAnimationTimer()
 	}
 	procShowWindow.Call(b.hwnd, swShowNoActivate)
@@ -488,14 +494,53 @@ func (b *winBackend) ensureAnimationTimer() {
 	if b.animTimer {
 		return
 	}
+	// Request finer timer granularity only while the short entrance/exit
+	// animation is active. The matching timeEndPeriod call is made as soon
+	// as the animation timer is stopped.
+	if procTimeBeginPeriod.Find() == nil {
+		if result, _, _ := procTimeBeginPeriod.Call(1); result == 0 {
+			b.timerResolution = true
+		}
+	}
+	result, _, _ := procSetTimer.Call(b.hwnd, 2, animationFrameInterval, 0)
+	if result == 0 {
+		b.finishAnimationImmediately()
+		return
+	}
 	b.animTimer = true
-	procSetTimer.Call(b.hwnd, 2, 16, 0)
+}
+
+func (b *winBackend) stopAnimationTimer() {
+	if b.animTimer {
+		procKillTimer.Call(b.hwnd, 2)
+		b.animTimer = false
+	}
+	if b.timerResolution {
+		procTimeEndPeriod.Call(1)
+		b.timerResolution = false
+	}
+}
+
+func (b *winBackend) finishAnimationImmediately() {
+	kind := b.anim.kind
+	b.stopAnimationTimer()
+	b.anim.stop()
+	b.alpha = 255
+	if b.hwnd == 0 {
+		return
+	}
+	procSetLayeredWindowAttributes.Call(b.hwnd, 0, 255, 2)
+	if kind == animExit {
+		procShowWindow.Call(b.hwnd, swHide)
+		b.visible.Store(false)
+		return
+	}
+	procSetWindowPos.Call(b.hwnd, 0, uintptr(b.baseX), uintptr(b.baseY), 0, 0, swpNoZOrder|swpNoActivate|swpNoSize)
 }
 
 func (b *winBackend) stepAnimation() {
 	if b.anim.kind == animNone {
-		procKillTimer.Call(b.hwnd, 2)
-		b.animTimer = false
+		b.stopAnimationTimer()
 		return
 	}
 	value, done := b.anim.progress(time.Now())
@@ -510,8 +555,7 @@ func (b *winBackend) stepAnimation() {
 	}
 	procSetWindowPos.Call(b.hwnd, 0, uintptr(b.baseX), uintptr(y), 0, 0, swpNoZOrder|swpNoActivate|swpNoSize)
 	if done {
-		procKillTimer.Call(b.hwnd, 2)
-		b.animTimer = false
+		b.stopAnimationTimer()
 		if b.anim.kind == animExit {
 			b.anim.stop()
 			procShowWindow.Call(b.hwnd, swHide)
@@ -552,15 +596,14 @@ func (b *winBackend) applyAutoCloseTimer() {
 func (b *winBackend) hideOnGUI() {
 	if b.visible.Load() && b.animations && systemAnimationsEnabled() && b.anim.kind != animExit {
 		procKillTimer.Call(b.hwnd, 1)
-		b.anim.begin(animExit, time.Now(), 120*time.Millisecond, float64(b.alpha)/255, 0)
+		b.anim.begin(animExit, time.Now(), animationExitDuration, float64(b.alpha)/255, 0)
 		b.ensureAnimationTimer()
 		return
 	}
 	if b.hwnd != 0 {
 		procKillTimer.Call(b.hwnd, 1)
-		procKillTimer.Call(b.hwnd, 2)
+		b.stopAnimationTimer()
 		b.anim.stop()
-		b.animTimer = false
 		b.alpha = 255
 		procSetLayeredWindowAttributes.Call(b.hwnd, 0, 255, 2)
 		procShowWindow.Call(b.hwnd, swHide)

@@ -2,6 +2,12 @@ package main
 
 import "time"
 
+const (
+	animationEnterDuration = 220 * time.Millisecond
+	animationExitDuration  = 160 * time.Millisecond
+	animationFrameInterval = 10 // milliseconds; paired with a temporary 1ms timer-resolution request on Windows.
+)
+
 // animation is the platform-independent part of the window chrome animation.
 // The Win32 backend only turns its scalar progress into alpha and Y offset.
 type animation struct {

@@ -711,23 +711,58 @@ func TestFloatingStartupSuppressesNotification(t *testing.T) {
 func TestAnimationEasingAndReverse(t *testing.T) {
 	now := fixedNow()
 	var a animation
-	a.begin(animEnter, now, 180*time.Millisecond, 0, 1)
+	a.begin(animEnter, now, animationEnterDuration, 0, 1)
 	if got, done := a.progress(now); got != 0 || done {
 		t.Fatalf("start = %v %v", got, done)
 	}
-	if got, done := a.progress(now.Add(90 * time.Millisecond)); got <= 0 || got >= 1 || done {
+	if got, done := a.progress(now.Add(animationEnterDuration / 2)); got <= 0 || got >= 1 || done {
 		t.Fatalf("mid = %v %v", got, done)
 	}
-	if got, done := a.progress(now.Add(180 * time.Millisecond)); got != 1 || !done {
+	if got, done := a.progress(now.Add(animationEnterDuration)); got != 1 || !done {
 		t.Fatalf("end = %v %v", got, done)
 	}
-	a.begin(animExit, now, 120*time.Millisecond, 1, 0)
-	if got, done := a.progress(now.Add(60 * time.Millisecond)); got <= 0 || got >= 1 || done {
+	a.begin(animExit, now, animationExitDuration, 1, 0)
+	if got, done := a.progress(now.Add(animationExitDuration / 2)); got <= 0 || got >= 1 || done {
 		t.Fatalf("exit mid = %v %v", got, done)
 	}
 	a.begin(animEnter, now, 0, 0, 1)
 	if got, done := a.progress(now); got != 1 || !done {
 		t.Fatalf("zero duration = %v %v", got, done)
+	}
+}
+
+func TestAnimationProgressMonotonicAtFrameIntervals(t *testing.T) {
+	now := fixedNow()
+	var enter animation
+	enter.begin(animEnter, now, animationEnterDuration, 0, 1)
+	previous := -1.0
+	step := time.Duration(animationFrameInterval) * time.Millisecond
+	for elapsed := time.Duration(0); elapsed <= animationEnterDuration; elapsed += step {
+		value, _ := enter.progress(now.Add(elapsed))
+		if value < previous {
+			t.Fatalf("enter animation moved backwards at %s: %v < %v", elapsed, value, previous)
+		}
+		previous = value
+	}
+	if previous != 1 {
+		value, done := enter.progress(now.Add(animationEnterDuration))
+		if !done || value != 1 {
+			t.Fatalf("enter animation final state = %v, done=%v", value, done)
+		}
+	}
+
+	var exit animation
+	exit.begin(animExit, now, animationExitDuration, 1, 0)
+	previous = 2
+	for elapsed := time.Duration(0); elapsed <= animationExitDuration; elapsed += step {
+		value, _ := exit.progress(now.Add(elapsed))
+		if value > previous {
+			t.Fatalf("exit animation moved backwards at %s: %v > %v", elapsed, value, previous)
+		}
+		previous = value
+	}
+	if value, done := exit.progress(now.Add(animationExitDuration)); value != 0 || !done {
+		t.Fatalf("exit animation final state = %v, done=%v", value, done)
 	}
 }
 
@@ -1725,9 +1760,7 @@ func TestReminderSoundCustomFileAndFallback(t *testing.T) {
 	p.sound = fake
 	p.settings["sound_enabled"] = true
 	wav := filepath.Join(t.TempDir(), "custom.wav")
-	if err := os.WriteFile(wav, []byte("fake wav"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	writeTestWAV(t, wav)
 	p.settings["sound_file"] = wav
 	p.mu.Lock()
 	p.playReminderSoundLocked()

@@ -539,19 +539,8 @@ func (p *Plugin) playReminderSoundLocked() {
 		}
 		return
 	}
-	if !strings.EqualFold(filepath.Ext(path), ".wav") {
-		p.logf("sound_file is not a WAV file; using the default system sound")
-		if err := p.sound.PlayDefault(); err != nil {
-			p.logf("default reminder sound failed: %v", err)
-		}
-		return
-	}
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		if err == nil {
-			err = errors.New("path is a directory")
-		}
-		p.logf("sound_file is unavailable (%v); using the default system sound", err)
+	if err := validateWAVFile(path); err != nil {
+		p.logf("sound_file is not a valid WAV file (%v); using the default system sound", err)
 		if defaultErr := p.sound.PlayDefault(); defaultErr != nil {
 			p.logf("default reminder sound failed: %v", defaultErr)
 		}
@@ -562,6 +551,16 @@ func (p *Plugin) playReminderSoundLocked() {
 		if defaultErr := p.sound.PlayDefault(); defaultErr != nil {
 			p.logf("default reminder sound failed: %v", defaultErr)
 		}
+	}
+}
+
+func (p *Plugin) warnInvalidSoundFile(path string) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	if err := validateWAVFile(path); err != nil {
+		p.logf("selected sound_file is invalid: %v", err)
+		p.notifyToast("自定义提示音不是有效的 WAV 文件；到期时将使用系统默认提示音。请重新选择 WAV 文件。")
 	}
 }
 
@@ -2030,10 +2029,12 @@ func (p *Plugin) handleLine(line []byte) bool {
 		if params.Settings != nil {
 			p.settings = params.Settings
 		}
+		initialSoundFile := p.stringSettingLocked("sound_file", "")
 		p.mu.Unlock()
 		p.applyWindowSettings()
 		p.applyTraySettings()
 		p.reply(req.ID, map[string]any{"protocolVersion": "1", "name": appName}, nil)
+		p.warnInvalidSoundFile(initialSoundFile)
 		go p.start()
 		return false
 	case "query":
@@ -2073,14 +2074,19 @@ func (p *Plugin) handleLine(line []byte) bool {
 		}
 		_ = json.Unmarshal(req.Params, &params)
 		p.mu.Lock()
+		oldSoundFile := p.stringSettingLocked("sound_file", "")
 		if params.Settings != nil {
 			p.settings = params.Settings
 		}
+		newSoundFile := p.stringSettingLocked("sound_file", "")
 		if p.floatingEnabledLocked() {
 			p.windowBroken = false
 		}
 		soundEnabled := p.soundEnabledLocked()
 		p.mu.Unlock()
+		if newSoundFile != "" && newSoundFile != oldSoundFile {
+			p.warnInvalidSoundFile(newSoundFile)
+		}
 		if !soundEnabled && p.sound != nil {
 			p.sound.Stop()
 		}

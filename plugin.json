@@ -6,7 +6,7 @@
     "zh": "倒计时",
     "en": "Countdown"
   },
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": {
     "zh": "原生 Go 版倒计时，无需安装 Python。支持多个计时器，到期后需确认并持续提醒。",
     "en": "Native Go countdown timers. Multiple timers, acknowledgement pending state, and repeated reminders until confirmed."
@@ -98,7 +98,7 @@
         "zh": "自定义提示音（WAV）",
         "en": "Custom reminder sound (WAV)"
       },
-      "hint": "只支持 .wav，留空使用系统默认提示音。",
+      "hint": "只接受有效的 WAV（RIFF/WAVE）文件；选择后会检查文件结构。无效文件会提示并回退系统声音。留空使用系统默认提示音。",
       "default": ""
     },
     {
