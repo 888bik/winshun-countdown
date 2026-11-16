@@ -89,6 +89,7 @@ func testPlugin(t *testing.T, now time.Time) (*Plugin, *bytes.Buffer, string) {
 	p := newPlugin(out, dir, func() time.Time { return now }, nil)
 	p.sound = &fakeSound{}
 	p.window = &fakeWindow{showOK: true}
+	p.tray = &fakeTrayBackend{}
 	p.settings["floating_window"] = false
 	return p, out, dir
 }
@@ -858,6 +859,305 @@ func TestRepeatSettingsClamp(t *testing.T) {
 	}
 }
 
+func TestTrayMenuModelGroupsSortsAndBuildsActions(t *testing.T) {
+	base := fixedNow()
+	items := []trayTimerSnapshot{
+		{ID: "late", Title: "午休", Status: statusRunning, RemainingSeconds: 300, EndsAt: base.Add(5 * time.Minute)},
+		{ID: "paused", Title: "学习", Status: statusPaused, RemainingSeconds: 45},
+		{ID: "pending", Title: "泡面", Status: statusPending, EndedAt: base.Add(-time.Minute)},
+		{ID: "early", Title: "会议", Status: statusRunning, RemainingSeconds: 60, EndsAt: base.Add(time.Minute)},
+	}
+	model := buildTrayMenuModel(items)
+	if len(model.Items) != 7 {
+		t.Fatalf("menu item count = %d, want 7: %#v", len(model.Items), model.Items)
+	}
+	if got, want := model.Items[0].Label, "倒计时 · 2 个在跑 · 1 个待确认"; got != want {
+		t.Fatalf("header = %q, want %q", got, want)
+	}
+	wantLabels := []string{
+		"会议 · 剩余 01:00",
+		"午休 · 剩余 05:00",
+		"学习 · 已暂停，剩余 00:45",
+		"泡面 · 已到期，等待确认",
+	}
+	for index, want := range wantLabels {
+		if got := model.Items[index+1].Label; got != want {
+			t.Fatalf("menu item %d = %q, want %q", index, got, want)
+		}
+	}
+	wantActions := [][]string{
+		{"pause", "cancel", "restart"},
+		{"pause", "cancel", "restart"},
+		{"resume", "cancel"},
+		{"acknowledge", "snooze", "restart"},
+	}
+	wantIDs := []string{"early", "late", "paused", "pending"}
+	for index, want := range wantActions {
+		entry := model.Items[index+1]
+		if len(entry.Children) != len(want) {
+			t.Fatalf("children for %q = %#v", entry.Label, entry.Children)
+		}
+		for childIndex, action := range want {
+			binding, ok := model.Commands[entry.Children[childIndex].CommandID]
+			if !ok || binding.Action != action || binding.TimerID != wantIDs[index] {
+				t.Fatalf("command binding for %q/%d = %#v, ok=%v", entry.Label, childIndex, binding, ok)
+			}
+		}
+	}
+	if !model.Items[5].Separator || model.Items[6].Label != "打开倒计时列表…" {
+		t.Fatalf("open-list placement: %#v", model.Items[5:])
+	}
+	if len(model.Commands) != 12 {
+		t.Fatalf("command count = %d, want 12", len(model.Commands))
+	}
+}
+
+func TestTrayEmptyMenuHasOnlyOpenListAction(t *testing.T) {
+	model := buildTrayMenuModel(nil)
+	if len(model.Items) != 3 || model.Items[0].Label != "倒计时 · 没有正在运行的计时器" {
+		t.Fatalf("empty menu = %#v", model.Items)
+	}
+	if !model.Items[0].Disabled || !model.Items[1].Separator || model.Items[2].Label != "打开倒计时列表…" {
+		t.Fatalf("empty menu structure = %#v", model.Items)
+	}
+	if len(model.Commands) != 1 {
+		t.Fatalf("empty menu command count = %d, want 1", len(model.Commands))
+	}
+	for _, binding := range model.Commands {
+		if !binding.OpenList {
+			t.Fatalf("empty menu command is not open-list: %#v", binding)
+		}
+	}
+}
+
+func TestTrayMenuRuneTruncationAndTwentyTimerLimit(t *testing.T) {
+	longTitle := strings.Repeat("中", 45)
+	items := make([]trayTimerSnapshot, 0, 21)
+	items = append(items, trayTimerSnapshot{
+		ID: "long", Title: longTitle, Status: statusRunning,
+		RemainingSeconds: 10, EndsAt: fixedNow().Add(10 * time.Second),
+	})
+	for index := 0; index < 20; index++ {
+		items = append(items, trayTimerSnapshot{
+			ID:    fmt.Sprintf("timer-%02d", index),
+			Title: fmt.Sprintf("任务%d", index), Status: statusRunning,
+			RemainingSeconds: int64(index + 20), EndsAt: fixedNow().Add(time.Duration(index+20) * time.Second),
+		})
+	}
+	model := buildTrayMenuModel(items)
+	if got, want := model.Items[1].Label, strings.Repeat("中", 40)+"… · 剩余 00:10"; got != want {
+		t.Fatalf("truncated title = %q, want %q", got, want)
+	}
+	if len(model.Items) != 24 {
+		t.Fatalf("overflow menu item count = %d, want 24", len(model.Items))
+	}
+	if got, want := model.Items[21].Label, "还有 1 个，去列表里看"; got != want || !model.Items[21].Disabled {
+		t.Fatalf("overflow item = %#v, want disabled %q", model.Items[21], want)
+	}
+	if len(model.Commands) != 61 {
+		t.Fatalf("visible action/open command count = %d, want 61", len(model.Commands))
+	}
+}
+
+func TestTrayCommandDispatchUsesExistingTimerActions(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     string
+		action     string
+		wantStatus string
+		wantGone   bool
+		wantEnd    time.Duration
+	}{
+		{name: "pause", status: statusRunning, action: "pause", wantStatus: statusPaused},
+		{name: "resume", status: statusPaused, action: "resume", wantStatus: statusRunning, wantEnd: 30 * time.Second},
+		{name: "cancel running", status: statusRunning, action: "cancel", wantGone: true},
+		{name: "restart running", status: statusRunning, action: "restart", wantStatus: statusRunning, wantEnd: 60 * time.Second},
+		{name: "acknowledge", status: statusPending, action: "acknowledge", wantGone: true},
+		{name: "snooze", status: statusPending, action: "snooze", wantStatus: statusRunning, wantEnd: 5 * time.Minute},
+		{name: "restart pending", status: statusPending, action: "restart", wantStatus: statusRunning, wantEnd: 60 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			now := fixedNow()
+			p, _, _ := testPlugin(t, now)
+			item := &timer{
+				ID: "timer-id", Title: "任务", CreatedAt: now,
+				EndsAt: now.Add(30 * time.Second), Status: tc.status,
+				OriginalSeconds: 60, RemainingSeconds: 30,
+			}
+			if tc.status == statusPending {
+				item.EndsAt = time.Time{}
+				item.EndedAt = now
+				item.NextReminderAt = now.Add(time.Minute)
+			}
+			if tc.status == statusPaused {
+				item.EndsAt = time.Time{}
+			}
+			p.timers[item.ID] = item
+			p.handleTrayAction(item.ID, tc.action)
+			got := p.timers[item.ID]
+			if tc.wantGone {
+				if got != nil {
+					t.Fatalf("timer still exists after %s: %#v", tc.action, got)
+				}
+				return
+			}
+			if got == nil || got.Status != tc.wantStatus {
+				t.Fatalf("timer after %s = %#v, want status %q", tc.action, got, tc.wantStatus)
+			}
+			if tc.wantEnd > 0 && !got.EndsAt.Equal(now.Add(tc.wantEnd)) {
+				t.Fatalf("EndsAt after %s = %v, want %v", tc.action, got.EndsAt, now.Add(tc.wantEnd))
+			}
+		})
+	}
+}
+
+func TestTrayTooltipTextStates(t *testing.T) {
+	base := fixedNow()
+	tests := []struct {
+		name  string
+		items []trayTimerSnapshot
+		want  string
+	}{
+		{
+			name:  "running",
+			items: []trayTimerSnapshot{{ID: "a", Status: statusRunning, RemainingSeconds: 150, EndsAt: base.Add(150 * time.Second)}},
+			want:  "倒计时：1 个在跑，最近 02:30 后到期",
+		},
+		{
+			name: "running and pending",
+			items: []trayTimerSnapshot{
+				{ID: "a", Status: statusRunning, RemainingSeconds: 150, EndsAt: base.Add(150 * time.Second)},
+				{ID: "b", Status: statusPending, EndedAt: base},
+			},
+			want: "倒计时：1 个在跑 · 1 个待确认",
+		},
+		{
+			name: "empty",
+			want: "倒计时：没有正在运行的计时器",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildTrayTooltip(tc.items); got != tc.want {
+				t.Fatalf("tooltip = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTraySettingChangesApplyImmediately(t *testing.T) {
+	p, _, _ := testPlugin(t, fixedNow())
+	fake := p.tray.(*fakeTrayBackend)
+	p.settings["tray_icon"] = true
+	p.applyTraySettings()
+	if enabled, adds, _, _, _, _, _ := fake.snapshot(); !enabled || adds != 1 {
+		t.Fatalf("enable state: enabled=%v adds=%d", enabled, adds)
+	}
+	p.handleLine([]byte(`{"jsonrpc":"2.0","method":"settingsChanged","params":{"settings":{"tray_icon":false}}}`))
+	if enabled, _, _, deletes, _, _, _ := fake.snapshot(); enabled || deletes != 1 {
+		t.Fatalf("disable state: enabled=%v deletes=%d", enabled, deletes)
+	}
+	p.handleLine([]byte(`{"jsonrpc":"2.0","method":"settingsChanged","params":{"settings":{"tray_icon":true}}}`))
+	if enabled, adds, _, _, _, _, _ := fake.snapshot(); !enabled || adds != 2 {
+		t.Fatalf("re-enable state: enabled=%v adds=%d", enabled, adds)
+	}
+}
+
+func TestTrayTaskbarCreatedRestoresIcon(t *testing.T) {
+	p, _, _ := testPlugin(t, fixedNow())
+	fake := p.tray.(*fakeTrayBackend)
+	p.settings["tray_icon"] = true
+	p.applyTraySettings()
+	p.tray.TaskbarCreated()
+	if enabled, adds, _, _, readds, _, _ := fake.snapshot(); !enabled || adds != 2 || readds != 1 {
+		t.Fatalf("Explorer restart state: enabled=%v adds=%d readds=%d", enabled, adds, readds)
+	}
+}
+
+func TestTrayCloseDeletesIconOnStop(t *testing.T) {
+	p, _, _ := testPlugin(t, fixedNow())
+	fake := p.tray.(*fakeTrayBackend)
+	p.settings["tray_icon"] = true
+	p.applyTraySettings()
+	p.stop()
+	enabled, _, _, deletes, _, closes, _ := fake.snapshot()
+	if enabled || deletes != 1 || closes != 1 {
+		t.Fatalf("stop did not remove tray icon: enabled=%v deletes=%d closes=%d", enabled, deletes, closes)
+	}
+}
+
+func TestTrayTooltipRefreshesAfterTimerStateChanges(t *testing.T) {
+	now := fixedNow()
+	p, _, _ := testPlugin(t, now)
+	fake := p.tray.(*fakeTrayBackend)
+	p.settings["tray_icon"] = true
+	p.applyTraySettings()
+
+	p.startTimer("托盘更新", 60)
+	_, _, _, _, _, _, items := fake.snapshot()
+	if len(items) != 1 || items[0].Status != statusRunning {
+		t.Fatalf("tray snapshot after start = %#v", items)
+	}
+	id := items[0].ID
+	p.pauseTimer(id)
+	_, _, _, _, _, _, items = fake.snapshot()
+	if len(items) != 1 || items[0].Status != statusPaused {
+		t.Fatalf("tray snapshot after pause = %#v", items)
+	}
+	p.resumeTimer(id)
+	_, _, _, _, _, _, items = fake.snapshot()
+	if len(items) != 1 || items[0].Status != statusRunning {
+		t.Fatalf("tray snapshot after resume = %#v", items)
+	}
+	p.restartTimer(id)
+	_, _, _, _, _, _, items = fake.snapshot()
+	if len(items) != 1 || items[0].Status != statusRunning {
+		t.Fatalf("tray snapshot after restart = %#v", items)
+	}
+	p.processDue(now.Add(time.Minute))
+	_, _, _, _, _, _, items = fake.snapshot()
+	if len(items) != 1 || items[0].Status != statusPending {
+		t.Fatalf("tray snapshot after expiry = %#v", items)
+	}
+	p.snoozeTimer(id)
+	_, _, _, _, _, _, items = fake.snapshot()
+	if len(items) != 1 || items[0].Status != statusRunning {
+		t.Fatalf("tray snapshot after snooze = %#v", items)
+	}
+	p.processDue(now.Add(5 * time.Minute))
+	_, _, _, _, _, _, items = fake.snapshot()
+	if len(items) != 1 || items[0].Status != statusPending {
+		t.Fatalf("tray snapshot after snooze expiry = %#v", items)
+	}
+	p.acknowledgeTimer(id)
+	_, _, _, _, _, _, items = fake.snapshot()
+	if len(items) != 0 {
+		t.Fatalf("tray snapshot after acknowledge = %#v", items)
+	}
+}
+
+func TestTrayOpenListUsesNotificationSetQueryBridge(t *testing.T) {
+	p, out, _ := testPlugin(t, fixedNow())
+	p.openListFromTray()
+	var message map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &message); err != nil {
+		t.Fatalf("decode tray open-list notification: %v; output=%s", err, out.String())
+	}
+	if message["method"] != "winshun/notify" {
+		t.Fatalf("method = %v, want winshun/notify", message["method"])
+	}
+	params := message["params"].(map[string]any)
+	click := params["click"].([]any)
+	if len(click) != 1 {
+		t.Fatalf("click effects = %#v", click)
+	}
+	effect := click[0].(map[string]any)
+	if effect["type"] != "setQuery" || effect["text"] != "倒计时 " {
+		t.Fatalf("click effect = %#v, want setQuery with the countdown keyword", effect)
+	}
+}
+
 func TestPendingActionsIncludeSnooze(t *testing.T) {
 	now := fixedNow()
 	p, _, _ := testPlugin(t, now)
@@ -1141,6 +1441,65 @@ func TestProtocolSmokeWithBuiltBinary(t *testing.T) {
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("process exit: %v; stderr=%s", err, stderr.String())
 	}
+}
+
+type fakeTrayBackend struct {
+	mu            sync.Mutex
+	enabled       bool
+	addCalls      int
+	modifyCalls   int
+	deleteCalls   int
+	taskbarReadds int
+	closeCalls    int
+	lastItems     []trayTimerSnapshot
+	setCalls      []bool
+}
+
+func (f *fakeTrayBackend) SetEnabled(enabled bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setCalls = append(f.setCalls, enabled)
+	if enabled && !f.enabled {
+		f.addCalls++
+	}
+	if !enabled && f.enabled {
+		f.deleteCalls++
+	}
+	f.enabled = enabled
+}
+
+func (f *fakeTrayBackend) Update(items []trayTimerSnapshot) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastItems = append([]trayTimerSnapshot(nil), items...)
+	if f.enabled {
+		f.modifyCalls++
+	}
+}
+
+func (f *fakeTrayBackend) TaskbarCreated() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.enabled {
+		f.addCalls++
+		f.taskbarReadds++
+	}
+}
+
+func (f *fakeTrayBackend) Close() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.enabled {
+		f.deleteCalls++
+	}
+	f.enabled = false
+	f.closeCalls++
+}
+
+func (f *fakeTrayBackend) snapshot() (enabled bool, adds, modifies, deletes, readds, closes int, items []trayTimerSnapshot) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.enabled, f.addCalls, f.modifyCalls, f.deleteCalls, f.taskbarReadds, f.closeCalls, append([]trayTimerSnapshot(nil), f.lastItems...)
 }
 
 type fakeSound struct {

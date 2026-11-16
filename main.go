@@ -100,6 +100,181 @@ type soundBackend interface {
 	Stop()
 }
 
+type trayTimerSnapshot struct {
+	ID               string
+	Title            string
+	Status           string
+	RemainingSeconds int64
+	EndsAt           time.Time
+	EndedAt          time.Time
+}
+
+type trayActionBinding struct {
+	Action   string
+	TimerID  string
+	OpenList bool
+}
+
+type trayMenuItem struct {
+	Label     string
+	Disabled  bool
+	Separator bool
+	CommandID uint32
+	Children  []trayMenuItem
+}
+
+type trayMenuModel struct {
+	Items    []trayMenuItem
+	Commands map[uint32]trayActionBinding
+}
+
+type trayCallbacks struct {
+	Snapshot func() []trayTimerSnapshot
+	Action   func(timerID, action string)
+	OpenList func()
+}
+
+type trayBackend interface {
+	SetEnabled(enabled bool)
+	Update(items []trayTimerSnapshot)
+	TaskbarCreated()
+	Close()
+}
+
+const (
+	trayMaxMenuTimers  = 20
+	trayFirstCommandID = uint32(5000)
+)
+
+func normalizedTrayStatus(status string) string {
+	if status == "" {
+		return statusRunning
+	}
+	return status
+}
+
+func truncateTrayTitle(title string, limit int) string {
+	if limit < 1 {
+		return ""
+	}
+	runes := []rune(title)
+	if len(runes) <= limit {
+		return title
+	}
+	return string(runes[:limit]) + "…"
+}
+
+func sortedTraySnapshots(items []trayTimerSnapshot) (running, paused, pending []trayTimerSnapshot) {
+	for _, item := range items {
+		switch normalizedTrayStatus(item.Status) {
+		case statusRunning:
+			running = append(running, item)
+		case statusPaused:
+			paused = append(paused, item)
+		case statusPending:
+			pending = append(pending, item)
+		}
+	}
+	sort.Slice(running, func(i, j int) bool {
+		if running[i].EndsAt.Equal(running[j].EndsAt) {
+			return running[i].ID < running[j].ID
+		}
+		if running[i].EndsAt.IsZero() || running[j].EndsAt.IsZero() {
+			if running[i].RemainingSeconds == running[j].RemainingSeconds {
+				return running[i].ID < running[j].ID
+			}
+			return running[i].RemainingSeconds < running[j].RemainingSeconds
+		}
+		return running[i].EndsAt.Before(running[j].EndsAt)
+	})
+	sort.Slice(paused, func(i, j int) bool {
+		if paused[i].RemainingSeconds == paused[j].RemainingSeconds {
+			return paused[i].ID < paused[j].ID
+		}
+		return paused[i].RemainingSeconds < paused[j].RemainingSeconds
+	})
+	sort.Slice(pending, func(i, j int) bool {
+		if pending[i].EndedAt.Equal(pending[j].EndedAt) {
+			return pending[i].ID < pending[j].ID
+		}
+		return pending[i].EndedAt.Before(pending[j].EndedAt)
+	})
+	return running, paused, pending
+}
+
+func buildTrayMenuModel(items []trayTimerSnapshot) trayMenuModel {
+	running, paused, pending := sortedTraySnapshots(items)
+	header := "倒计时 · 没有正在运行的计时器"
+	if len(running) > 0 {
+		header = fmt.Sprintf("倒计时 · %d 个在跑", len(running))
+	}
+	if len(pending) > 0 {
+		header += fmt.Sprintf(" · %d 个待确认", len(pending))
+	}
+
+	model := trayMenuModel{
+		Items:    []trayMenuItem{{Label: header, Disabled: true}},
+		Commands: make(map[uint32]trayActionBinding),
+	}
+	nextID := trayFirstCommandID
+	addTimer := func(item trayTimerSnapshot, label string, actions ...string) {
+		entry := trayMenuItem{Label: truncateTrayTitle(label, 100)}
+		for _, action := range actions {
+			commandID := nextID
+			nextID++
+			model.Commands[commandID] = trayActionBinding{Action: action, TimerID: item.ID}
+			entry.Children = append(entry.Children, trayMenuItem{
+				Label: actionTitle(action), CommandID: commandID,
+			})
+		}
+		model.Items = append(model.Items, entry)
+	}
+
+	ordered := make([]trayTimerSnapshot, 0, len(items))
+	ordered = append(ordered, running...)
+	ordered = append(ordered, paused...)
+	ordered = append(ordered, pending...)
+	visible := len(ordered)
+	if visible > trayMaxMenuTimers {
+		visible = trayMaxMenuTimers
+	}
+	for _, item := range ordered[:visible] {
+		switch normalizedTrayStatus(item.Status) {
+		case statusRunning:
+			addTimer(item, truncateTrayTitle(item.Title, 40)+" · 剩余 "+formatSeconds(item.RemainingSeconds), "pause", "cancel", "restart")
+		case statusPaused:
+			addTimer(item, truncateTrayTitle(item.Title, 40)+" · 已暂停，剩余 "+formatSeconds(item.RemainingSeconds), "resume", "cancel")
+		case statusPending:
+			addTimer(item, truncateTrayTitle(item.Title, 40)+" · 已到期，等待确认", "acknowledge", "snooze", "restart")
+		}
+	}
+	if len(ordered) > visible {
+		model.Items = append(model.Items, trayMenuItem{
+			Label:    fmt.Sprintf("还有 %d 个，去列表里看", len(ordered)-visible),
+			Disabled: true,
+		})
+	}
+	model.Items = append(model.Items, trayMenuItem{Separator: true})
+	openID := nextID
+	model.Commands[openID] = trayActionBinding{OpenList: true}
+	model.Items = append(model.Items, trayMenuItem{Label: "打开倒计时列表…", CommandID: openID})
+	return model
+}
+
+func buildTrayTooltip(items []trayTimerSnapshot) string {
+	running, _, pending := sortedTraySnapshots(items)
+	text := "倒计时：没有正在运行的计时器"
+	switch {
+	case len(running) > 0 && len(pending) > 0:
+		text = fmt.Sprintf("倒计时：%d 个在跑 · %d 个待确认", len(running), len(pending))
+	case len(running) > 0:
+		text = fmt.Sprintf("倒计时：%d 个在跑，最近 %s 后到期", len(running), formatSeconds(running[0].RemainingSeconds))
+	case len(pending) > 0:
+		text = fmt.Sprintf("倒计时：没有正在运行的计时器 · %d 个待确认", len(pending))
+	}
+	return truncateTrayTitle(text, 127)
+}
+
 type Plugin struct {
 	outMu sync.Mutex
 	out   io.Writer
@@ -115,6 +290,7 @@ type Plugin struct {
 	windowBroken    bool
 	window          windowBackend
 	sound           soundBackend
+	tray            trayBackend
 	corrupt         bool
 	started         bool
 	stopped         bool
@@ -150,6 +326,11 @@ func newPlugin(out io.Writer, dataDir string, now func() time.Time, newID func()
 		SnoozeAll: p.snoozeAllFromWindow,
 		Failed:    p.windowFailed,
 		Wake:      p.wakeScheduler,
+	})
+	p.tray = newTrayBackend(trayCallbacks{
+		Snapshot: p.traySnapshot,
+		Action:   p.handleTrayAction,
+		OpenList: p.openListFromTray,
 	})
 	return p
 }
@@ -266,6 +447,70 @@ func pageIndices(total, scroll, page int) []int {
 		out = append(out, index)
 	}
 	return out
+}
+
+func (p *Plugin) trayEnabledLocked() bool {
+	return p.boolSettingLocked("tray_icon", true)
+}
+
+func (p *Plugin) traySnapshotLocked(now time.Time) []trayTimerSnapshot {
+	items := make([]trayTimerSnapshot, 0, len(p.timers))
+	for _, item := range p.timers {
+		snapshot := trayTimerSnapshot{
+			ID:      item.ID,
+			Title:   item.Title,
+			Status:  normalizedTrayStatus(item.Status),
+			EndsAt:  item.EndsAt,
+			EndedAt: item.EndedAt,
+		}
+		switch snapshot.Status {
+		case statusRunning:
+			remaining := int64(math.Ceil(item.EndsAt.Sub(now).Seconds()))
+			if remaining < 1 {
+				remaining = 1
+			}
+			snapshot.RemainingSeconds = remaining
+		case statusPaused:
+			snapshot.RemainingSeconds = item.RemainingSeconds
+		}
+		items = append(items, snapshot)
+	}
+	return items
+}
+
+func (p *Plugin) traySnapshot() []trayTimerSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.traySnapshotLocked(p.now())
+}
+
+func (p *Plugin) refreshTray() {
+	if p.tray == nil {
+		return
+	}
+	p.tray.Update(p.traySnapshot())
+}
+
+func (p *Plugin) applyTraySettings() {
+	if p.tray == nil {
+		return
+	}
+	p.mu.Lock()
+	enabled := p.trayEnabledLocked()
+	items := p.traySnapshotLocked(p.now())
+	p.mu.Unlock()
+	p.tray.SetEnabled(enabled)
+	p.tray.Update(items)
+}
+
+func (p *Plugin) handleTrayAction(timerID, action string) {
+	p.beginInteraction()
+	defer p.endInteraction()
+	_ = p.doActionNamed(actionData{TimerID: timerID}, action)
+}
+
+func (p *Plugin) openListFromTray() {
+	p.notifyToast("点击此通知打开倒计时列表。")
 }
 
 func (p *Plugin) popupCenterLocked() bool {
@@ -516,6 +761,7 @@ func (p *Plugin) snoozeIDs(ids []string) ([]string, int, bool) {
 	p.stopReminderSoundLocked()
 	p.mu.Unlock()
 	p.wakeScheduler()
+	p.refreshTray()
 	return titles, minutes, true
 }
 
@@ -573,6 +819,7 @@ func (p *Plugin) confirmPending(id string) bool {
 	p.stopReminderSoundLocked()
 	p.mu.Unlock()
 	p.wakeScheduler()
+	p.refreshTray()
 	return true
 }
 
@@ -627,7 +874,7 @@ func (p *Plugin) refreshList() {
 
 func (p *Plugin) start() {
 	p.mu.Lock()
-	if p.started {
+	if p.started || p.stopped {
 		p.mu.Unlock()
 		return
 	}
@@ -640,20 +887,33 @@ func (p *Plugin) start() {
 
 func (p *Plugin) stop() {
 	p.mu.Lock()
-	if !p.started || p.stopped {
+	if p.stopped {
 		p.mu.Unlock()
 		return
 	}
 	p.stopped = true
-	close(p.stopCh)
-	done := p.doneCh
+	started := p.started
+	var done chan struct{}
+	if started {
+		close(p.stopCh)
+		done = p.doneCh
+	}
 	p.mu.Unlock()
-	<-done
+	if started {
+		<-done
+	}
+	if p.sound != nil {
+		p.sound.Stop()
+	}
+	if p.tray != nil {
+		p.tray.Close()
+	}
 }
 
 func (p *Plugin) run() {
 	defer close(p.doneCh)
 	p.load()
+	p.refreshTray()
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
@@ -1081,6 +1341,7 @@ func (p *Plugin) processDue(now time.Time) {
 		p.refreshList()
 	}
 	p.mu.Unlock()
+	p.refreshTray()
 	if floating {
 		p.syncWindow(true)
 	} else {
@@ -1531,6 +1792,7 @@ func (p *Plugin) startTimer(title string, seconds int64) map[string]any {
 	p.listVisible = false
 	p.mu.Unlock()
 	p.wakeScheduler()
+	p.refreshTray()
 	p.notifyToast("倒计时已开始：" + title + " " + humanDuration(seconds))
 	return map[string]any{"effects": []map[string]any{{"type": "hide"}}}
 }
@@ -1568,6 +1830,7 @@ func (p *Plugin) pauseTimer(id string) map[string]any {
 	p.listVisible = false
 	p.mu.Unlock()
 	p.wakeScheduler()
+	p.refreshTray()
 	p.notifyToast("已暂停：" + title)
 	return map[string]any{"effects": []map[string]any{{"type": "hide"}}}
 }
@@ -1603,6 +1866,7 @@ func (p *Plugin) resumeTimer(id string) map[string]any {
 	p.listVisible = false
 	p.mu.Unlock()
 	p.wakeScheduler()
+	p.refreshTray()
 	p.notifyToast("已继续：" + title)
 	return map[string]any{"effects": []map[string]any{{"type": "hide"}}}
 }
@@ -1644,6 +1908,7 @@ func (p *Plugin) restartTimer(id string) map[string]any {
 	p.listVisible = false
 	p.mu.Unlock()
 	p.wakeScheduler()
+	p.refreshTray()
 	p.syncWindow(false)
 	p.notifyToast("已重新开始：" + title)
 	return map[string]any{"effects": []map[string]any{{"type": "hide"}}}
@@ -1672,6 +1937,7 @@ func (p *Plugin) cancelTimer(id string) map[string]any {
 	p.listVisible = false
 	p.mu.Unlock()
 	p.wakeScheduler()
+	p.refreshTray()
 	p.notifyToast("已取消：" + title)
 	if visible {
 		p.refreshList()
@@ -1698,6 +1964,7 @@ func (p *Plugin) acknowledgeTimer(id string) map[string]any {
 	p.stopReminderSoundLocked()
 	p.mu.Unlock()
 	p.wakeScheduler()
+	p.refreshTray()
 	p.syncWindow(false)
 	p.refreshList()
 	return map[string]any{"effects": []map[string]any{
@@ -1765,6 +2032,7 @@ func (p *Plugin) handleLine(line []byte) bool {
 		}
 		p.mu.Unlock()
 		p.applyWindowSettings()
+		p.applyTraySettings()
 		p.reply(req.ID, map[string]any{"protocolVersion": "1", "name": appName}, nil)
 		go p.start()
 		return false
@@ -1817,6 +2085,7 @@ func (p *Plugin) handleLine(line []byte) bool {
 			p.sound.Stop()
 		}
 		p.applyWindowSettings()
+		p.applyTraySettings()
 		p.syncWindow(false)
 		p.wakeScheduler()
 		return false
