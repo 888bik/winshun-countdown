@@ -6,7 +6,7 @@
     "zh": "倒计时",
     "en": "Countdown"
   },
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": {
     "zh": "原生 Go 版倒计时，无需安装 Python。支持多个计时器，到期后需确认并持续提醒。",
     "en": "Native Go countdown timers. Multiple timers, acknowledgement pending state, and repeated reminders until confirmed."
@@ -81,6 +81,34 @@
         "en": "Floating window animations (slide/fade)"
       },
       "default": true
+    },
+    {
+      "key": "sound_enabled",
+      "type": "bool",
+      "title": {
+        "zh": "到期声音提示",
+        "en": "Play a sound when a timer expires"
+      },
+      "default": true
+    },
+    {
+      "key": "sound_file",
+      "type": "file",
+      "title": {
+        "zh": "自定义提示音（WAV）",
+        "en": "Custom reminder sound (WAV)"
+      },
+      "hint": "只支持 .wav，留空使用系统默认提示音。",
+      "default": ""
+    },
+    {
+      "key": "popup_center",
+      "type": "bool",
+      "title": {
+        "zh": "到期弹窗居中显示",
+        "en": "Center the reminder window"
+      },
+      "default": false
     }
   ],
   "commands": [
@@ -95,4 +123,3 @@
     }
   ]
 }
-

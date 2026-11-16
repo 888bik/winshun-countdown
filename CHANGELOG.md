@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.0
+
+- 新增暂停/继续：运行中计时器可暂停并持久化剩余秒数；暂停项排在列表末尾，Enter 继续，第二个动作取消。暂停项不占 20 个运行名额，也不会参与后台到期调度。
+- 新增重新开始：运行中和待确认计时器可从原始总时长重新计时；重置结束/重复提醒字段，待确认项目重新开始时停止当前提示音。
+- 新增到期声音提示：`sound_enabled` 默认开启；支持 `sound_file` 文件设置，仅接受 WAV。首次到期和每次重复提醒播放异步声音，确认/稍后提醒时停止；路径无效或播放失败时记录日志并回退系统默认音。默认声音使用 Windows `PlaySoundW` 的 `SND_ALIAS` / `SystemAsterisk`。
+- 新增 `popup_center` 设置（默认关闭）：可将悬浮窗放到当前最近显示器工作区中央；关闭时保持原有右下角位置，设置变化立即生效。
+- 数据格式版本保持 v2；新增可选 `originalSeconds` 和 `remainingSeconds` 字段。旧记录缺少 `originalSeconds` 时自动按 `endsAt - createdAt` 回填，无需手动迁移；暂停记录以 `status: paused` 和 `remainingSeconds` 持久化。
+- 插件版本及 manifest assembly version 升至 1.5.0 / 1.5.0.0。
+
 ## 1.4.0
 
 - Deferred floating window/notification wakeups are capped at 2.5 seconds even when a pending timer's next repeat is far away. Without `deferredWindow`, the nearest deadline and 30-second cap are unchanged.

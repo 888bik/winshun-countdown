@@ -32,6 +32,7 @@ const (
 	dataVersion    = 2
 	statusRunning  = "running"
 	statusPending  = "pending_ack"
+	statusPaused   = "paused"
 	acknowledged   = "acknowledged"
 	parseErrorText = "时长看不懂，试试 25、25m、90s、1h30m、25:00。"
 	emptyTitle     = "目前没有正在运行的倒计时。"
@@ -39,25 +40,29 @@ const (
 )
 
 type timer struct {
-	ID             string
-	Title          string
-	CreatedAt      time.Time
-	EndsAt         time.Time
-	Status         string
-	EndedAt        time.Time
-	NextReminderAt time.Time
-	ReminderCount  int
+	ID               string
+	Title            string
+	CreatedAt        time.Time
+	EndsAt           time.Time
+	Status           string
+	EndedAt          time.Time
+	NextReminderAt   time.Time
+	ReminderCount    int
+	OriginalSeconds  int64
+	RemainingSeconds int64
 }
 
 type storedTimer struct {
-	ID             string `json:"id"`
-	Title          string `json:"title"`
-	CreatedAt      string `json:"createdAt"`
-	EndsAt         string `json:"endsAt"`
-	Status         string `json:"status,omitempty"`
-	EndedAt        string `json:"endedAt,omitempty"`
-	NextReminderAt string `json:"nextReminderAt,omitempty"`
-	ReminderCount  int    `json:"reminderCount,omitempty"`
+	ID               string `json:"id"`
+	Title            string `json:"title"`
+	CreatedAt        string `json:"createdAt"`
+	EndsAt           string `json:"endsAt"`
+	Status           string `json:"status,omitempty"`
+	EndedAt          string `json:"endedAt,omitempty"`
+	NextReminderAt   string `json:"nextReminderAt,omitempty"`
+	ReminderCount    int    `json:"reminderCount,omitempty"`
+	OriginalSeconds  int64  `json:"originalSeconds,omitempty"`
+	RemainingSeconds int64  `json:"remainingSeconds,omitempty"`
 }
 
 type storedFile struct {
@@ -86,6 +91,13 @@ type windowBackend interface {
 	Visible() bool
 	SetAutoClose(seconds int)
 	SetAnimations(enabled bool)
+	SetPopupCenter(enabled bool)
+}
+
+type soundBackend interface {
+	PlayFile(path string) error
+	PlayDefault() error
+	Stop()
 }
 
 type Plugin struct {
@@ -102,6 +114,7 @@ type Plugin struct {
 	deferredWindow  bool
 	windowBroken    bool
 	window          windowBackend
+	sound           soundBackend
 	corrupt         bool
 	started         bool
 	stopped         bool
@@ -128,6 +141,7 @@ func newPlugin(out io.Writer, dataDir string, now func() time.Time, newID func()
 		now:      now,
 		newID:    newID,
 		wakeCh:   make(chan struct{}, 1),
+		sound:    newSoundBackend(),
 	}
 	p.window = newWindowBackend(windowCallbacks{
 		Ack:       p.acknowledgeFromWindow,
@@ -181,16 +195,36 @@ func (p *Plugin) intSettingLocked(key string, fallback, minimum, maximum int) in
 	return number
 }
 
-func (p *Plugin) animationsEnabledLocked() bool {
-	value, ok := p.settings["animations"]
+func (p *Plugin) boolSettingLocked(key string, fallback bool) bool {
+	value, ok := p.settings[key]
 	if !ok {
-		return true
+		return fallback
 	}
 	enabled, ok := value.(bool)
 	if !ok {
-		return true
+		return fallback
 	}
 	return enabled
+}
+
+func (p *Plugin) stringSettingLocked(key, fallback string) string {
+	value, ok := p.settings[key]
+	if !ok {
+		return fallback
+	}
+	text, ok := value.(string)
+	if !ok {
+		return fallback
+	}
+	return text
+}
+
+func (p *Plugin) animationsEnabledLocked() bool {
+	return p.boolSettingLocked("animations", true)
+}
+
+func (p *Plugin) soundEnabledLocked() bool {
+	return p.boolSettingLocked("sound_enabled", true)
 }
 
 func (p *Plugin) autoCloseSecondsLocked() int {
@@ -234,13 +268,72 @@ func pageIndices(total, scroll, page int) []int {
 	return out
 }
 
+func (p *Plugin) popupCenterLocked() bool {
+	return p.boolSettingLocked("popup_center", false)
+}
+
 func (p *Plugin) applyWindowSettings() {
 	p.mu.Lock()
 	seconds := p.autoCloseSecondsLocked()
 	animations := p.animationsEnabledLocked()
+	center := p.popupCenterLocked()
 	p.mu.Unlock()
 	p.window.SetAutoClose(seconds)
 	p.window.SetAnimations(animations)
+	p.window.SetPopupCenter(center)
+}
+
+func (p *Plugin) playReminderSoundLocked() {
+	if !p.soundEnabledLocked() || p.sound == nil {
+		return
+	}
+	path := strings.TrimSpace(p.stringSettingLocked("sound_file", ""))
+	if path == "" {
+		if err := p.sound.PlayDefault(); err != nil {
+			p.logf("default reminder sound failed: %v", err)
+		}
+		return
+	}
+	if !strings.EqualFold(filepath.Ext(path), ".wav") {
+		p.logf("sound_file is not a WAV file; using the default system sound")
+		if err := p.sound.PlayDefault(); err != nil {
+			p.logf("default reminder sound failed: %v", err)
+		}
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		if err == nil {
+			err = errors.New("path is a directory")
+		}
+		p.logf("sound_file is unavailable (%v); using the default system sound", err)
+		if defaultErr := p.sound.PlayDefault(); defaultErr != nil {
+			p.logf("default reminder sound failed: %v", defaultErr)
+		}
+		return
+	}
+	if err := p.sound.PlayFile(path); err != nil {
+		p.logf("custom reminder sound failed (%v); using the default system sound", err)
+		if defaultErr := p.sound.PlayDefault(); defaultErr != nil {
+			p.logf("default reminder sound failed: %v", defaultErr)
+		}
+	}
+}
+
+func (p *Plugin) stopReminderSoundLocked() {
+	if p.sound != nil {
+		p.sound.Stop()
+	}
+}
+
+func runningCountLocked(timers map[string]*timer) int {
+	running := 0
+	for _, item := range timers {
+		if item.Status == "" || item.Status == statusRunning {
+			running++
+		}
+	}
+	return running
 }
 
 func (p *Plugin) pendingItemsLocked() []pendingItem {
@@ -420,6 +513,7 @@ func (p *Plugin) snoozeIDs(ids []string) ([]string, int, bool) {
 		return nil, minutes, false
 	}
 	p.listVisible = false
+	p.stopReminderSoundLocked()
 	p.mu.Unlock()
 	p.wakeScheduler()
 	return titles, minutes, true
@@ -476,6 +570,7 @@ func (p *Plugin) confirmPending(id string) bool {
 		return false
 	}
 	p.listVisible = false
+	p.stopReminderSoundLocked()
 	p.mu.Unlock()
 	p.wakeScheduler()
 	return true
@@ -619,9 +714,17 @@ func (p *Plugin) deferredWakeDelayLocked(now time.Time) time.Duration {
 func (p *Plugin) nextWakeDelayLocked(now time.Time) (time.Duration, bool) {
 	var next time.Time
 	for _, item := range p.timers {
-		candidate := item.NextReminderAt
-		if item.Status != statusPending {
+		var candidate time.Time
+		switch item.Status {
+		case statusPending:
+			candidate = item.NextReminderAt
+		case "", statusRunning:
 			candidate = item.EndsAt
+		case statusPaused:
+			// Paused timers have no deadline and must not wake the scheduler.
+			continue
+		default:
+			continue
 		}
 		if candidate.IsZero() {
 			continue
@@ -659,11 +762,37 @@ func (p *Plugin) timerListLocked() []*timer {
 	for _, item := range p.timers {
 		list = append(list, item)
 	}
+	priority := func(status string) int {
+		switch status {
+		case statusPending:
+			return 0
+		case "", statusRunning:
+			return 1
+		case statusPaused:
+			return 2
+		default:
+			return 3
+		}
+	}
 	sort.Slice(list, func(i, j int) bool {
-		if list[i].EndsAt.Equal(list[j].EndsAt) {
+		left, right := priority(list[i].Status), priority(list[j].Status)
+		if left != right {
+			return left < right
+		}
+		if list[i].Status == statusPaused {
+			if list[i].RemainingSeconds == list[j].RemainingSeconds {
+				return list[i].ID < list[j].ID
+			}
+			return list[i].RemainingSeconds < list[j].RemainingSeconds
+		}
+		leftTime, rightTime := list[i].EndsAt, list[j].EndsAt
+		if list[i].Status == statusPending {
+			leftTime, rightTime = list[i].EndedAt, list[j].EndedAt
+		}
+		if leftTime.Equal(rightTime) {
 			return list[i].ID < list[j].ID
 		}
-		return list[i].EndsAt.Before(list[j].EndsAt)
+		return leftTime.Before(rightTime)
 	})
 	return list
 }
@@ -687,8 +816,13 @@ func (p *Plugin) saveLocked() error {
 		stored := storedTimer{
 			ID: item.ID, Title: item.Title,
 			CreatedAt: item.CreatedAt.Format(time.RFC3339Nano),
-			EndsAt:    item.EndsAt.Format(time.RFC3339Nano),
-			Status:    status,
+			Status:    status, OriginalSeconds: item.OriginalSeconds,
+		}
+		if status != statusPaused {
+			stored.EndsAt = item.EndsAt.Format(time.RFC3339Nano)
+		}
+		if status == statusPaused {
+			stored.RemainingSeconds = item.RemainingSeconds
 		}
 		if status == statusPending {
 			stored.EndedAt = item.EndedAt.Format(time.RFC3339Nano)
@@ -755,9 +889,8 @@ func (p *Plugin) load() {
 	newlyPending := make([]string, 0)
 	changed := doc.Version < dataVersion
 	for _, raw := range doc.Timers {
-		created, err1 := time.Parse(time.RFC3339, raw.CreatedAt)
-		ends, err2 := time.Parse(time.RFC3339, raw.EndsAt)
-		if err1 != nil || err2 != nil || strings.TrimSpace(raw.ID) == "" || strings.TrimSpace(raw.Title) == "" {
+		created, err := time.Parse(time.RFC3339Nano, raw.CreatedAt)
+		if err != nil || strings.TrimSpace(raw.ID) == "" || strings.TrimSpace(raw.Title) == "" {
 			p.failCorrupt("countdown.json 含无效计时记录，原文件未覆盖")
 			return
 		}
@@ -774,9 +907,38 @@ func (p *Plugin) load() {
 			changed = true
 			continue
 		}
+		var ends time.Time
+		if status != statusPaused {
+			if raw.EndsAt == "" {
+				p.failCorrupt("countdown.json 的 endsAt 缺失，原文件未覆盖")
+				return
+			}
+			parsed, parseErr := time.Parse(time.RFC3339Nano, raw.EndsAt)
+			if parseErr != nil {
+				p.failCorrupt("countdown.json 的 endsAt 无效，原文件未覆盖")
+				return
+			}
+			ends = parsed
+		}
+		originalSeconds := raw.OriginalSeconds
+		if originalSeconds <= 0 {
+			if !ends.IsZero() {
+				originalSeconds = int64(ends.Sub(created) / time.Second)
+			} else if status == statusPaused && raw.RemainingSeconds > 0 {
+				originalSeconds = raw.RemainingSeconds
+			}
+			if originalSeconds < 1 {
+				originalSeconds = 1
+			}
+			changed = true
+		}
+		if originalSeconds > maxDuration {
+			p.failCorrupt("countdown.json 的 originalSeconds 超出范围，原文件未覆盖")
+			return
+		}
 		item := &timer{
 			ID: raw.ID, Title: raw.Title, CreatedAt: created,
-			EndsAt: ends, Status: status,
+			EndsAt: ends, Status: status, OriginalSeconds: originalSeconds,
 		}
 		switch status {
 		case statusRunning:
@@ -786,6 +948,7 @@ func (p *Plugin) load() {
 				item.Status = statusPending
 				item.EndedAt = ends
 				item.NextReminderAt = now.Add(time.Duration(p.repeatFirstSecondsLocked()) * time.Second)
+				item.ReminderCount = 0
 				restored[item.ID] = item
 				newlyPending = append(newlyPending, item.Title)
 				changed = true
@@ -793,7 +956,7 @@ func (p *Plugin) load() {
 		case statusPending:
 			item.EndedAt = ends
 			if raw.EndedAt != "" {
-				parsed, parseErr := time.Parse(time.RFC3339, raw.EndedAt)
+				parsed, parseErr := time.Parse(time.RFC3339Nano, raw.EndedAt)
 				if parseErr != nil {
 					p.failCorrupt("countdown.json 的 endedAt 无效，原文件未覆盖")
 					return
@@ -801,7 +964,7 @@ func (p *Plugin) load() {
 				item.EndedAt = parsed
 			}
 			if raw.NextReminderAt != "" {
-				parsed, parseErr := time.Parse(time.RFC3339, raw.NextReminderAt)
+				parsed, parseErr := time.Parse(time.RFC3339Nano, raw.NextReminderAt)
 				if parseErr != nil {
 					p.failCorrupt("countdown.json 的 nextReminderAt 无效，原文件未覆盖")
 					return
@@ -813,6 +976,15 @@ func (p *Plugin) load() {
 			}
 			item.ReminderCount = raw.ReminderCount
 			restored[item.ID] = item
+		case statusPaused:
+			if raw.RemainingSeconds < 1 || raw.RemainingSeconds > maxDuration {
+				p.failCorrupt("countdown.json 的 remainingSeconds 无效，原文件未覆盖")
+				return
+			}
+			item.EndsAt = time.Time{}
+			item.RemainingSeconds = raw.RemainingSeconds
+			restored[item.ID] = item
+		case acknowledged:
 		default:
 			p.failCorrupt("countdown.json 含未知状态，原文件未覆盖")
 			return
@@ -883,6 +1055,8 @@ func (p *Plugin) processDue(now time.Time) {
 				item.NextReminderAt = now.Add(time.Duration(p.repeatEverySecondsLocked()) * time.Second)
 				titles = append(titles, item.Title)
 			}
+		case statusPaused:
+			// Paused timers are intentionally excluded from expiry processing.
 		}
 	}
 	if len(titles) == 0 {
@@ -899,8 +1073,9 @@ func (p *Plugin) processDue(now time.Time) {
 		p.logf("expiry save failed: %v", err)
 		return
 	}
-	// Keep the lock through state changes so an acknowledge cannot race
-	// between the state check and the reminder being scheduled.
+	// Keep the lock through persistence and asynchronous sound start so an
+	// acknowledge/snooze cannot race ahead and leave audio playing afterward.
+	p.playReminderSoundLocked()
 	floating := p.floatingEnabledLocked()
 	if p.listVisible {
 		p.refreshList()
@@ -1065,6 +1240,19 @@ func humanDuration(seconds int64) string {
 	return strings.Join(parts, " ")
 }
 
+func formatSeconds(seconds int64) string {
+	if seconds < 1 {
+		seconds = 1
+	}
+	hours := seconds / 3600
+	minutes := (seconds % 3600) / 60
+	secs := seconds % 60
+	if hours > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", hours, minutes, secs)
+	}
+	return fmt.Sprintf("%02d:%02d", minutes, secs)
+}
+
 func formatRemaining(endsAt, now time.Time) string {
 	seconds := int64(math.Ceil(endsAt.Sub(now).Seconds()))
 	if seconds < 1 {
@@ -1084,17 +1272,26 @@ func previewID(title string, seconds int64) string {
 	return "start-" + hex.EncodeToString(sum[:6])
 }
 
+func centerPositionInArea(left, top, right, bottom, width, height int) (int, int) {
+	areaWidth := right - left
+	areaHeight := bottom - top
+	x := left
+	y := top
+	if areaWidth > width {
+		x = left + (areaWidth-width)/2
+	}
+	if areaHeight > height {
+		y = top + (areaHeight-height)/2
+	}
+	return x, y
+}
+
 func validItem(id, title, subtitle string) map[string]any {
 	return map[string]any{"id": id, "title": title, "subtitle": subtitle, "valid": false}
 }
 
 func actionItem(id, title, subtitle string, data map[string]any, action string) map[string]any {
-	actionTitle := "取消"
-	if action == "start" {
-		actionTitle = "开始"
-	} else if action == "acknowledge" {
-		actionTitle = "确认"
-	}
+	actionTitle := actionTitle(action)
 	item := map[string]any{
 		"id": id, "title": title, "subtitle": subtitle, "data": data,
 		"valid":   true,
@@ -1103,16 +1300,64 @@ func actionItem(id, title, subtitle string, data map[string]any, action string) 
 	return item
 }
 
+func actionTitle(action string) string {
+	switch action {
+	case "start":
+		return "开始"
+	case "acknowledge":
+		return "确认"
+	case "snooze":
+		return "稍后提醒"
+	case "pause":
+		return "暂停"
+	case "resume":
+		return "继续"
+	case "restart":
+		return "重新开始"
+	default:
+		return "取消"
+	}
+}
+
+func setItemActions(item map[string]any, actions ...string) {
+	result := make([]map[string]any, 0, len(actions))
+	for index, action := range actions {
+		entry := map[string]any{"id": action, "title": actionTitle(action)}
+		if index == 0 {
+			entry["key"] = "Enter"
+		}
+		result = append(result, entry)
+	}
+	item["actions"] = result
+}
+
+func runningItemView(item *timer, now time.Time) map[string]any {
+	result := actionItem(
+		item.ID, item.Title,
+		"剩余 "+formatRemaining(item.EndsAt, now)+" · Enter 取消",
+		map[string]any{"type": "cancel", "timerId": item.ID}, "cancel",
+	)
+	setItemActions(result, "cancel", "pause", "restart")
+	return result
+}
+
+func pausedItemView(item *timer) map[string]any {
+	result := actionItem(
+		item.ID, item.Title,
+		"已暂停，剩余 "+formatSeconds(item.RemainingSeconds)+" · Enter 继续",
+		map[string]any{"type": "resume", "timerId": item.ID}, "resume",
+	)
+	setItemActions(result, "resume", "cancel")
+	return result
+}
+
 func pendingItemView(item *timer) map[string]any {
 	result := actionItem(
 		item.ID, item.Title,
 		"已经结束，等待确认。 · Enter 确认已知晓",
 		map[string]any{"type": "acknowledge", "timerId": item.ID}, "acknowledge",
 	)
-	result["actions"] = []map[string]any{
-		{"id": "acknowledge", "title": "确认", "key": "Enter"},
-		{"id": "snooze", "title": "稍后提醒"},
-	}
+	setItemActions(result, "acknowledge", "snooze", "restart")
 	return result
 }
 
@@ -1127,12 +1372,7 @@ func (p *Plugin) query(text string) ([]map[string]any, int) {
 		}
 		p.mu.Lock()
 		corrupt := p.corrupt
-		running := 0
-		for _, item := range p.timers {
-			if item.Status == "" || item.Status == statusRunning {
-				running++
-			}
-		}
+		running := runningCountLocked(p.timers)
 		p.mu.Unlock()
 		if corrupt {
 			return []map[string]any{validItem("corrupt", "倒计时数据文件损坏，请检查 countdown.json。", "")}, 0
@@ -1151,7 +1391,11 @@ func (p *Plugin) query(text string) ([]map[string]any, int) {
 
 	p.mu.Lock()
 	corrupt := p.corrupt
-	all := p.timerListLocked()
+	ordered := p.timerListLocked()
+	all := make([]timer, len(ordered))
+	for index, item := range ordered {
+		all[index] = *item
+	}
 	p.mu.Unlock()
 	if corrupt {
 		p.setListVisible(false)
@@ -1159,7 +1403,9 @@ func (p *Plugin) query(text string) ([]map[string]any, int) {
 	}
 	pending := make([]*timer, 0)
 	running := make([]*timer, 0)
-	for _, item := range all {
+	paused := make([]*timer, 0)
+	for index := range all {
+		item := &all[index]
 		switch item.Status {
 		case statusPending:
 			pending = append(pending, item)
@@ -1167,9 +1413,11 @@ func (p *Plugin) query(text string) ([]map[string]any, int) {
 			if item.EndsAt.After(now) {
 				running = append(running, item)
 			}
+		case statusPaused:
+			paused = append(paused, item)
 		}
 	}
-	if len(pending) == 0 && len(running) == 0 {
+	if len(pending) == 0 && len(running) == 0 && len(paused) == 0 {
 		p.setListVisible(false)
 		return []map[string]any{validItem("empty", emptyTitle, emptyHint)}, 0
 	}
@@ -1185,16 +1433,21 @@ func (p *Plugin) query(text string) ([]map[string]any, int) {
 		}
 		return running[i].EndsAt.Before(running[j].EndsAt)
 	})
-	items := make([]map[string]any, 0, len(pending)+len(running))
+	sort.Slice(paused, func(i, j int) bool {
+		if paused[i].RemainingSeconds == paused[j].RemainingSeconds {
+			return paused[i].ID < paused[j].ID
+		}
+		return paused[i].RemainingSeconds < paused[j].RemainingSeconds
+	})
+	items := make([]map[string]any, 0, len(pending)+len(running)+len(paused))
 	for _, item := range pending {
 		items = append(items, pendingItemView(item))
 	}
 	for _, item := range running {
-		items = append(items, actionItem(
-			item.ID, item.Title,
-			"剩余 "+formatRemaining(item.EndsAt, now)+" · Enter 取消",
-			map[string]any{"type": "cancel", "timerId": item.ID}, "cancel",
-		))
+		items = append(items, runningItemView(item, now))
+	}
+	for _, item := range paused {
+		items = append(items, pausedItemView(item))
 	}
 	p.setListVisible(true)
 	return items, 1
@@ -1218,10 +1471,10 @@ func (p *Plugin) doAction(data actionData) map[string]any {
 }
 
 func (p *Plugin) doActionNamed(data actionData, action string) map[string]any {
-	if action == "snooze" {
-		return p.snoozeTimer(data.TimerID)
+	if action == "" {
+		action = data.Type
 	}
-	switch data.Type {
+	switch action {
 	case "start":
 		return p.startTimer(data.Title, data.Seconds)
 	case "cancel":
@@ -1230,6 +1483,12 @@ func (p *Plugin) doActionNamed(data actionData, action string) map[string]any {
 		return p.acknowledgeTimer(data.TimerID)
 	case "snooze":
 		return p.snoozeTimer(data.TimerID)
+	case "pause":
+		return p.pauseTimer(data.TimerID)
+	case "resume":
+		return p.resumeTimer(data.TimerID)
+	case "restart":
+		return p.restartTimer(data.TimerID)
 	default:
 		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "未知操作。"}}}
 	}
@@ -1248,12 +1507,7 @@ func (p *Plugin) startTimer(title string, seconds int64) map[string]any {
 		p.mu.Unlock()
 		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "倒计时数据文件损坏，未创建。"}}}
 	}
-	running := 0
-	for _, item := range p.timers {
-		if item.Status == "" || item.Status == statusRunning {
-			running++
-		}
-	}
+	running := runningCountLocked(p.timers)
 	if running >= maxTimers {
 		p.mu.Unlock()
 		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "最多同时运行 20 个倒计时。"}}}
@@ -1266,6 +1520,7 @@ func (p *Plugin) startTimer(title string, seconds int64) map[string]any {
 	item := &timer{
 		ID: id, Title: title, CreatedAt: now,
 		EndsAt: now.Add(time.Duration(seconds) * time.Second), Status: statusRunning,
+		OriginalSeconds: seconds,
 	}
 	p.timers[item.ID] = item
 	if err := p.saveLocked(); err != nil {
@@ -1277,6 +1532,120 @@ func (p *Plugin) startTimer(title string, seconds int64) map[string]any {
 	p.mu.Unlock()
 	p.wakeScheduler()
 	p.notifyToast("倒计时已开始：" + title + " " + humanDuration(seconds))
+	return map[string]any{"effects": []map[string]any{{"type": "hide"}}}
+}
+
+func (p *Plugin) pauseTimer(id string) map[string]any {
+	id = strings.TrimSpace(id)
+	p.mu.Lock()
+	item := p.timers[id]
+	if item == nil || (item.Status != "" && item.Status != statusRunning) {
+		p.mu.Unlock()
+		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "该计时器当前不能暂停。"}}}
+	}
+	now := p.now()
+	if item.EndsAt.Before(now) {
+		p.mu.Unlock()
+		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "倒计时已经到期，不能暂停。"}}}
+	}
+	before := *item
+	title := item.Title
+	remaining := int64(math.Ceil(item.EndsAt.Sub(now).Seconds()))
+	if remaining < 1 {
+		remaining = 1
+	}
+	item.Status = statusPaused
+	item.EndsAt = time.Time{}
+	item.RemainingSeconds = remaining
+	if item.OriginalSeconds < 1 {
+		item.OriginalSeconds = remaining
+	}
+	if err := p.saveLocked(); err != nil {
+		*item = before
+		p.mu.Unlock()
+		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "保存失败，未暂停。"}}}
+	}
+	p.listVisible = false
+	p.mu.Unlock()
+	p.wakeScheduler()
+	p.notifyToast("已暂停：" + title)
+	return map[string]any{"effects": []map[string]any{{"type": "hide"}}}
+}
+
+func (p *Plugin) resumeTimer(id string) map[string]any {
+	id = strings.TrimSpace(id)
+	p.mu.Lock()
+	item := p.timers[id]
+	if item == nil || item.Status != statusPaused || item.RemainingSeconds < 1 {
+		p.mu.Unlock()
+		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "该计时器当前不能继续。"}}}
+	}
+	if runningCountLocked(p.timers) >= maxTimers {
+		p.mu.Unlock()
+		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "最多同时运行 20 个倒计时。"}}}
+	}
+	before := *item
+	title := item.Title
+	item.EndsAt = p.now().Add(time.Duration(item.RemainingSeconds) * time.Second)
+	item.RemainingSeconds = 0
+	item.Status = statusRunning
+	if item.OriginalSeconds < 1 {
+		item.OriginalSeconds = int64(math.Ceil(item.EndsAt.Sub(item.CreatedAt).Seconds()))
+		if item.OriginalSeconds < 1 {
+			item.OriginalSeconds = 1
+		}
+	}
+	if err := p.saveLocked(); err != nil {
+		*item = before
+		p.mu.Unlock()
+		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "保存失败，未继续倒计时。"}}}
+	}
+	p.listVisible = false
+	p.mu.Unlock()
+	p.wakeScheduler()
+	p.notifyToast("已继续：" + title)
+	return map[string]any{"effects": []map[string]any{{"type": "hide"}}}
+}
+
+func (p *Plugin) restartTimer(id string) map[string]any {
+	id = strings.TrimSpace(id)
+	p.mu.Lock()
+	item := p.timers[id]
+	if item == nil || (item.Status != statusRunning && item.Status != statusPending) {
+		p.mu.Unlock()
+		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "该计时器当前不能重新开始。"}}}
+	}
+	if item.Status == statusPending && runningCountLocked(p.timers) >= maxTimers {
+		p.mu.Unlock()
+		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "最多同时运行 20 个倒计时。"}}}
+	}
+	seconds := item.OriginalSeconds
+	if seconds < 1 || seconds > maxDuration {
+		p.mu.Unlock()
+		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "原始时长无效，无法重新开始。"}}}
+	}
+	before := *item
+	title := item.Title
+	now := p.now()
+	item.EndsAt = now.Add(time.Duration(seconds) * time.Second)
+	item.Status = statusRunning
+	item.EndedAt = time.Time{}
+	item.NextReminderAt = time.Time{}
+	item.ReminderCount = 0
+	item.RemainingSeconds = 0
+	if err := p.saveLocked(); err != nil {
+		*item = before
+		p.mu.Unlock()
+		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "保存失败，未重新开始。"}}}
+	}
+	if before.Status == statusPending {
+		p.stopReminderSoundLocked()
+	}
+	p.listVisible = false
+	p.mu.Unlock()
+	p.wakeScheduler()
+	p.syncWindow(false)
+	p.notifyToast("已重新开始：" + title)
 	return map[string]any{"effects": []map[string]any{{"type": "hide"}}}
 }
 
@@ -1292,6 +1661,7 @@ func (p *Plugin) cancelTimer(id string) map[string]any {
 		p.mu.Unlock()
 		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "已经结束，请按 Enter 确认。"}}}
 	}
+	title := item.Title
 	delete(p.timers, id)
 	if err := p.saveLocked(); err != nil {
 		p.timers[id] = item
@@ -1302,7 +1672,7 @@ func (p *Plugin) cancelTimer(id string) map[string]any {
 	p.listVisible = false
 	p.mu.Unlock()
 	p.wakeScheduler()
-	p.notifyToast("已取消：" + item.Title)
+	p.notifyToast("已取消：" + title)
 	if visible {
 		p.refreshList()
 	}
@@ -1317,6 +1687,7 @@ func (p *Plugin) acknowledgeTimer(id string) map[string]any {
 		p.mu.Unlock()
 		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "该计时器已确认或不存在。"}}}
 	}
+	title := item.Title
 	delete(p.timers, id)
 	if err := p.saveLocked(); err != nil {
 		p.timers[id] = item
@@ -1324,12 +1695,13 @@ func (p *Plugin) acknowledgeTimer(id string) map[string]any {
 		return map[string]any{"effects": []map[string]any{{"type": "notify", "text": "保存失败，未确认。"}}}
 	}
 	p.listVisible = false
+	p.stopReminderSoundLocked()
 	p.mu.Unlock()
 	p.wakeScheduler()
 	p.syncWindow(false)
 	p.refreshList()
 	return map[string]any{"effects": []map[string]any{
-		{"type": "notify", "text": "已确认：" + item.Title},
+		{"type": "notify", "text": "已确认：" + title},
 		{"type": "hide"},
 	}}
 }
@@ -1439,7 +1811,11 @@ func (p *Plugin) handleLine(line []byte) bool {
 		if p.floatingEnabledLocked() {
 			p.windowBroken = false
 		}
+		soundEnabled := p.soundEnabledLocked()
 		p.mu.Unlock()
+		if !soundEnabled && p.sound != nil {
+			p.sound.Stop()
+		}
 		p.applyWindowSettings()
 		p.syncWindow(false)
 		p.wakeScheduler()

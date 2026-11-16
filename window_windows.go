@@ -181,6 +181,7 @@ type winCommand struct {
 	items      []pendingItem
 	seconds    int
 	animations bool
+	center     bool
 }
 
 const (
@@ -189,6 +190,7 @@ const (
 	winHide
 	winAutoClose
 	winAnimations
+	winPopupCenter
 )
 
 type winBackend struct {
@@ -202,6 +204,7 @@ type winBackend struct {
 	autoClose    atomic.Int64
 	lastActivity time.Time
 	animations   bool
+	popupCenter  bool
 	alpha        int
 	anim         animation
 	animTimer    bool
@@ -260,6 +263,11 @@ func (b *winBackend) drainCommands() {
 			b.applyAutoCloseTimer()
 		case winAnimations:
 			b.animations = command.animations
+		case winPopupCenter:
+			b.popupCenter = command.center
+			if b.hwnd != 0 && b.visible.Load() {
+				b.layout()
+			}
 		}
 	}
 }
@@ -286,6 +294,10 @@ func (b *winBackend) SetAutoClose(seconds int) {
 
 func (b *winBackend) SetAnimations(enabled bool) {
 	b.post(winCommand{kind: winAnimations, animations: enabled})
+}
+
+func (b *winBackend) SetPopupCenter(enabled bool) {
+	b.post(winCommand{kind: winPopupCenter, center: enabled})
 }
 
 func (b *winBackend) Visible() bool {
@@ -593,7 +605,12 @@ func (b *winBackend) layout() {
 	if height > maxHeight {
 		height = maxHeight
 	}
-	x, y := b.bottomRight(width, height)
+	var x, y int
+	if b.popupCenter {
+		x, y = b.centerPosition(width, height)
+	} else {
+		x, y = b.bottomRight(width, height)
+	}
 	procSetWindowPos.Call(b.hwnd, ^uintptr(0), uintptr(x), uintptr(y),
 		uintptr(width), uintptr(height), swpNoActivate)
 	b.updateScroll()
@@ -666,6 +683,22 @@ func (b *winBackend) createButton(text string, id, x, y, width, height int) uint
 		procSendMessageW.Call(button, wmSetFont, b.fontButton, 1)
 	}
 	return button
+}
+
+func (b *winBackend) centerPosition(width, height int) (int, int) {
+	monitor, _, _ := procMonitorFromWindow.Call(b.hwnd, 2) // MONITOR_DEFAULTTONEAREST
+	info := monitorInfo{cbSize: uint32(unsafe.Sizeof(monitorInfo{}))}
+	if monitor != 0 {
+		if ok, _, _ := procGetMonitorInfoW.Call(monitor, uintptr(unsafe.Pointer(&info))); ok != 0 {
+			return centerPositionInArea(
+				int(info.rcWork.left), int(info.rcWork.top),
+				int(info.rcWork.right), int(info.rcWork.bottom), width, height,
+			)
+		}
+	}
+	screenW, _, _ := procGetSystemMetrics.Call(0)
+	screenH, _, _ := procGetSystemMetrics.Call(1)
+	return centerPositionInArea(0, 0, int(screenW), int(screenH), width, height)
 }
 
 func (b *winBackend) bottomRight(width, height int) (int, int) {

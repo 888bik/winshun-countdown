@@ -16,5 +16,6 @@ func (stubWindow) Hide()                   {}
 func (stubWindow) Visible() bool           { return false }
 func (stubWindow) SetAutoClose(int)        {}
 func (stubWindow) SetAnimations(bool)      {}
+func (stubWindow) SetPopupCenter(bool)     {}
 
 func initDpiAwareness() {}

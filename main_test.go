@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,14 +19,15 @@ func fixedNow() time.Time {
 }
 
 type fakeWindow struct {
-	mu        sync.Mutex
-	visible   bool
-	items     []pendingItem
-	shows     int
-	refreshes int
-	hides     int
-	showOK    bool
-	autoClose int
+	mu          sync.Mutex
+	visible     bool
+	items       []pendingItem
+	shows       int
+	refreshes   int
+	hides       int
+	showOK      bool
+	autoClose   int
+	popupCenter bool
 }
 
 func (f *fakeWindow) SetAutoClose(seconds int) {
@@ -35,6 +37,12 @@ func (f *fakeWindow) SetAutoClose(seconds int) {
 }
 
 func (f *fakeWindow) SetAnimations(bool) {}
+
+func (f *fakeWindow) SetPopupCenter(enabled bool) {
+	f.mu.Lock()
+	f.popupCenter = enabled
+	f.mu.Unlock()
+}
 
 func (f *fakeWindow) Show(items []pendingItem) bool {
 	f.mu.Lock()
@@ -79,6 +87,7 @@ func testPlugin(t *testing.T, now time.Time) (*Plugin, *bytes.Buffer, string) {
 	dir := t.TempDir()
 	out := &bytes.Buffer{}
 	p := newPlugin(out, dir, func() time.Time { return now }, nil)
+	p.sound = &fakeSound{}
 	p.window = &fakeWindow{showOK: true}
 	p.settings["floating_window"] = false
 	return p, out, dir
@@ -359,6 +368,7 @@ func TestRestartRestoresPendingAndNextReminder(t *testing.T) {
 	p.processDue(now.Add(60 * time.Second))
 
 	p2 := newPlugin(&bytes.Buffer{}, dir, func() time.Time { return now.Add(70 * time.Second) }, nil)
+	p2.sound = &fakeSound{}
 	p2.window = &fakeWindow{showOK: true}
 	p2.settings["floating_window"] = false
 	p2.load()
@@ -405,6 +415,7 @@ func TestV1MigrationKeepsExpiredAsPending(t *testing.T) {
 	}
 	out := &bytes.Buffer{}
 	p := newPlugin(out, dir, func() time.Time { return now }, nil)
+	p.sound = &fakeSound{}
 	p.window = &fakeWindow{showOK: true}
 	p.settings["floating_window"] = false
 	p.load()
@@ -684,6 +695,7 @@ func TestFloatingStartupSuppressesNotification(t *testing.T) {
 	}
 	out := &bytes.Buffer{}
 	p := newPlugin(out, dir, func() time.Time { return now }, nil)
+	p.sound = &fakeSound{}
 	p.window = &fakeWindow{showOK: true}
 	p.settings["floating_window"] = true
 	p.load()
@@ -853,7 +865,7 @@ func TestPendingActionsIncludeSnooze(t *testing.T) {
 	p.processDue(now.Add(60 * time.Second))
 	items, _ := p.query("")
 	actions := items[0]["actions"].([]map[string]any)
-	if len(actions) != 2 || actions[0]["id"] != "acknowledge" || actions[1]["id"] != "snooze" {
+	if len(actions) != 3 || actions[0]["id"] != "acknowledge" || actions[1]["id"] != "snooze" || actions[2]["id"] != "restart" {
 		t.Fatalf("pending actions: %#v", actions)
 	}
 }
@@ -923,6 +935,7 @@ func TestPersistenceAndRecovery(t *testing.T) {
 	}
 
 	p2 := newPlugin(&bytes.Buffer{}, dir, func() time.Time { return now.Add(60 * time.Second) }, nil)
+	p2.sound = &fakeSound{}
 	p2.window = &fakeWindow{showOK: true}
 	p2.settings["floating_window"] = false
 	p2.load()
@@ -948,6 +961,7 @@ func TestExpiredRecoveryNotifiesOnce(t *testing.T) {
 	}
 	out := &bytes.Buffer{}
 	p := newPlugin(out, dir, func() time.Time { return now }, nil)
+	p.sound = &fakeSound{}
 	p.window = &fakeWindow{showOK: true}
 	p.settings["floating_window"] = false
 	p.load()
@@ -959,6 +973,7 @@ func TestExpiredRecoveryNotifiesOnce(t *testing.T) {
 	}
 	out.Reset()
 	p2 := newPlugin(out, dir, func() time.Time { return now }, nil)
+	p2.sound = &fakeSound{}
 	p2.window = &fakeWindow{showOK: true}
 	p2.settings["floating_window"] = false
 	p2.load()
@@ -980,6 +995,7 @@ func TestCorruptFileIsReportedAndNotOverwritten(t *testing.T) {
 	}
 	out := &bytes.Buffer{}
 	p := newPlugin(out, dir, func() time.Time { return now }, nil)
+	p.sound = &fakeSound{}
 	p.window = &fakeWindow{showOK: true}
 	p.load()
 	if !p.corrupt {
@@ -1005,6 +1021,7 @@ func TestSaveFailureDoesNotCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := newPlugin(&bytes.Buffer{}, block, func() time.Time { return now }, nil)
+	p.sound = &fakeSound{}
 	p.window = &fakeWindow{showOK: true}
 	result := p.startTimer("泡面", 60)
 	encoded, _ := json.Marshal(result)
@@ -1123,5 +1140,476 @@ func TestProtocolSmokeWithBuiltBinary(t *testing.T) {
 	_ = stdin.Close()
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("process exit: %v; stderr=%s", err, stderr.String())
+	}
+}
+
+type fakeSound struct {
+	mu           sync.Mutex
+	files        []string
+	defaultPlays int
+	stops        int
+	fileErr      error
+	defaultErr   error
+}
+
+func (f *fakeSound) PlayFile(path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.files = append(f.files, path)
+	return f.fileErr
+}
+
+func (f *fakeSound) PlayDefault() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.defaultPlays++
+	return f.defaultErr
+}
+
+func (f *fakeSound) Stop() {
+	f.mu.Lock()
+	f.stops++
+	f.mu.Unlock()
+}
+
+func (f *fakeSound) snapshot() (files []string, defaults, stops int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.files...), f.defaultPlays, f.stops
+}
+
+func TestPauseResumeLifecycleAndScheduler(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	p.settings["sound_enabled"] = false
+	p.startTimer("泡面", 5)
+	id := p.timerListLocked()[0].ID
+
+	current = current.Add(2 * time.Second)
+	p.pauseTimer(id)
+	item := p.timers[id]
+	if item.Status != statusPaused || item.RemainingSeconds != 3 || !item.EndsAt.IsZero() {
+		t.Fatalf("paused timer: %+v", item)
+	}
+	if delay, ok := p.nextWakeDelayLocked(current); ok {
+		t.Fatalf("paused timer should not create scheduler deadline: %v", delay)
+	}
+	p.processDue(current.Add(10 * time.Second))
+	if p.timers[id].Status != statusPaused {
+		t.Fatalf("paused timer expired: %+v", p.timers[id])
+	}
+
+	current = current.Add(20 * time.Second)
+	p.resumeTimer(id)
+	item = p.timers[id]
+	if item.Status != statusRunning || item.RemainingSeconds != 0 || !item.EndsAt.Equal(current.Add(3*time.Second)) {
+		t.Fatalf("resumed timer: %+v", item)
+	}
+	p.processDue(current.Add(2 * time.Second))
+	if p.timers[id].Status != statusRunning {
+		t.Fatalf("timer expired before remaining duration: %+v", p.timers[id])
+	}
+	p.processDue(current.Add(3 * time.Second))
+	if p.timers[id].Status != statusPending {
+		t.Fatalf("timer did not expire after resume: %+v", p.timers[id])
+	}
+}
+
+func TestPausedTimerPersistsAndRestores(t *testing.T) {
+	current := fixedNow()
+	p, _, dir := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	p.settings["sound_enabled"] = false
+	p.startTimer("午休", 25)
+	id := p.timerListLocked()[0].ID
+	current = current.Add(7 * time.Second)
+	p.pauseTimer(id)
+
+	p2 := newPlugin(&bytes.Buffer{}, dir, func() time.Time { return current.Add(time.Hour) }, nil)
+	p2.sound = &fakeSound{}
+	p2.window = &fakeWindow{showOK: true}
+	p2.settings["floating_window"] = false
+	p2.load()
+	item := p2.timers[id]
+	if item == nil || item.Status != statusPaused || item.RemainingSeconds != 18 || item.OriginalSeconds != 25 {
+		t.Fatalf("paused restore: %+v", item)
+	}
+	if delay, ok := p2.nextWakeDelayLocked(current.Add(time.Hour)); ok {
+		t.Fatalf("restored paused timer created deadline: %v", delay)
+	}
+}
+
+func TestPausedTimersDoNotConsumeRunningLimit(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	p.settings["sound_enabled"] = false
+	ids := make([]string, 0, maxTimers)
+	for index := 0; index < maxTimers; index++ {
+		p.startTimer(fmt.Sprintf("任务%d", index), 600)
+		for id, item := range p.timers {
+			if item.Title == fmt.Sprintf("任务%d", index) {
+				ids = append(ids, id)
+				break
+			}
+		}
+	}
+	p.pauseTimer(ids[0])
+	result := p.startTimer("替补", 600)
+	encoded, _ := json.Marshal(result)
+	if strings.Contains(string(encoded), "最多同时运行 20 个") {
+		t.Fatalf("paused timer consumed a running slot: %s", encoded)
+	}
+	result = p.resumeTimer(ids[0])
+	encoded, _ = json.Marshal(result)
+	if !strings.Contains(string(encoded), "最多同时运行 20 个") {
+		t.Fatalf("resume should enforce running limit: %s", encoded)
+	}
+}
+
+func TestPausedListSortsByRemainingSeconds(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	p.settings["sound_enabled"] = false
+	p.startTimer("剩余较多", 60)
+	p.startTimer("剩余较少", 30)
+	ids := make(map[string]string)
+	for id, item := range p.timers {
+		ids[item.Title] = id
+	}
+	current = current.Add(10 * time.Second)
+	p.pauseTimer(ids["剩余较多"])
+	current = current.Add(20 * time.Second)
+	p.pauseTimer(ids["剩余较少"])
+
+	items, _ := p.query("")
+	if len(items) != 2 || items[0]["title"] != "剩余较少" || items[1]["title"] != "剩余较多" {
+		t.Fatalf("paused list order: %#v", items)
+	}
+}
+
+func TestRestartRunningAndPendingUsesOriginalDuration(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	p.settings["sound_enabled"] = false
+	p.startTimer("运行中", 30)
+	var runningID string
+	for id, item := range p.timers {
+		if item.Title == "运行中" {
+			runningID = id
+		}
+	}
+	current = current.Add(5 * time.Second)
+	p.restartTimer(runningID)
+	if got, want := p.timers[runningID].EndsAt, current.Add(30*time.Second); !got.Equal(want) {
+		t.Fatalf("running restart endsAt=%v want=%v", got, want)
+	}
+	if p.timers[runningID].ReminderCount != 0 || !p.timers[runningID].EndedAt.IsZero() || !p.timers[runningID].NextReminderAt.IsZero() {
+		t.Fatalf("running restart did not clear reminder state: %+v", p.timers[runningID])
+	}
+
+	current = current.Add(31 * time.Second)
+	p.processDue(current)
+	if p.timers[runningID].Status != statusPending {
+		t.Fatalf("expected pending after running timer expires: %+v", p.timers[runningID])
+	}
+	p.timers[runningID].ReminderCount = 4
+	p.timers[runningID].NextReminderAt = current.Add(time.Minute)
+	p.restartTimer(runningID)
+	item := p.timers[runningID]
+	if item.Status != statusRunning || !item.EndsAt.Equal(current.Add(30*time.Second)) || item.ReminderCount != 0 || !item.EndedAt.IsZero() || !item.NextReminderAt.IsZero() {
+		t.Fatalf("pending restart: %+v", item)
+	}
+}
+
+func TestReminderSoundPlaysAndStops(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	fake := &fakeSound{}
+	p.sound = fake
+	p.settings["sound_enabled"] = true
+	p.settings["sound_file"] = ""
+	p.startTimer("泡面", 1)
+	id := p.timerListLocked()[0].ID
+
+	p.processDue(current.Add(time.Second))
+	_, defaults, _ := fake.snapshot()
+	if defaults != 1 {
+		t.Fatalf("initial expiry sound count=%d want=1", defaults)
+	}
+	p.processDue(current.Add(16 * time.Second))
+	_, defaults, _ = fake.snapshot()
+	if defaults != 2 {
+		t.Fatalf("repeat sound count=%d want=2", defaults)
+	}
+	if !p.confirmPending(id) {
+		t.Fatal("confirm pending failed")
+	}
+	_, _, stops := fake.snapshot()
+	if stops != 1 {
+		t.Fatalf("confirm stop count=%d want=1", stops)
+	}
+	p.processDue(current.Add(10 * time.Minute))
+	_, defaultsAfter, _ := fake.snapshot()
+	if defaultsAfter != 2 {
+		t.Fatalf("sound played after confirm: %d", defaultsAfter)
+	}
+}
+
+func TestReminderSoundCustomFileAndFallback(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	fake := &fakeSound{}
+	p.sound = fake
+	p.settings["sound_enabled"] = true
+	wav := filepath.Join(t.TempDir(), "custom.wav")
+	if err := os.WriteFile(wav, []byte("fake wav"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p.settings["sound_file"] = wav
+	p.mu.Lock()
+	p.playReminderSoundLocked()
+	p.mu.Unlock()
+	files, defaults, _ := fake.snapshot()
+	if len(files) != 1 || files[0] != wav || defaults != 0 {
+		t.Fatalf("custom WAV playback: files=%v defaults=%d", files, defaults)
+	}
+
+	p.settings["sound_file"] = filepath.Join(t.TempDir(), "missing.wav")
+	p.mu.Lock()
+	p.playReminderSoundLocked()
+	p.mu.Unlock()
+	_, defaults, _ = fake.snapshot()
+	if defaults != 1 {
+		t.Fatalf("missing WAV should fall back to default, defaults=%d", defaults)
+	}
+	p.settings["sound_file"] = wav + ".mp3"
+	p.mu.Lock()
+	p.playReminderSoundLocked()
+	p.mu.Unlock()
+	_, defaults, _ = fake.snapshot()
+	if defaults != 2 {
+		t.Fatalf("non-WAV should fall back to default, defaults=%d", defaults)
+	}
+
+	directoryWAV := filepath.Join(t.TempDir(), "directory.wav")
+	if err := os.Mkdir(directoryWAV, 0700); err != nil {
+		t.Fatal(err)
+	}
+	p.settings["sound_file"] = directoryWAV
+	p.mu.Lock()
+	p.playReminderSoundLocked()
+	p.mu.Unlock()
+	_, defaults, _ = fake.snapshot()
+	if defaults != 3 {
+		t.Fatalf("directory path should fall back to default, defaults=%d", defaults)
+	}
+
+	fake.fileErr = os.ErrInvalid
+	p.settings["sound_file"] = wav
+	p.mu.Lock()
+	p.playReminderSoundLocked()
+	p.mu.Unlock()
+	_, defaults, _ = fake.snapshot()
+	if defaults != 4 {
+		t.Fatalf("failed WAV playback should fall back to default, defaults=%d", defaults)
+	}
+}
+
+func TestSoundDisabledAndSnoozeStops(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	fake := &fakeSound{}
+	p.sound = fake
+	p.settings["sound_enabled"] = false
+	p.startTimer("关闭声音", 1)
+	id := p.timerListLocked()[0].ID
+	p.processDue(current.Add(time.Second))
+	_, defaults, _ := fake.snapshot()
+	if defaults != 0 {
+		t.Fatalf("disabled sound played %d times", defaults)
+	}
+
+	p.settings["sound_enabled"] = true
+	p.processDue(current.Add(time.Minute))
+	_, defaults, _ = fake.snapshot()
+	if defaults != 1 {
+		t.Fatalf("enabled repeat sound count=%d want=1", defaults)
+	}
+	p.snoozeIDs([]string{id})
+	_, _, stops := fake.snapshot()
+	if stops != 1 {
+		t.Fatalf("snooze stop count=%d want=1", stops)
+	}
+}
+
+func TestSettingsDisableStopsReminderSound(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	fake := &fakeSound{}
+	p.sound = fake
+	p.settings["sound_enabled"] = true
+	p.startTimer("设置关闭声音", 1)
+	p.processDue(current.Add(time.Second))
+	_, defaults, _ := fake.snapshot()
+	if defaults != 1 {
+		t.Fatalf("initial sound count=%d want=1", defaults)
+	}
+	params, err := json.Marshal(map[string]any{"settings": map[string]any{"sound_enabled": false}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "method": "settingsChanged", "params": json.RawMessage(params),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.handleLine(line)
+	_, _, stops := fake.snapshot()
+	if stops != 1 {
+		t.Fatalf("disabling sound should stop current playback, stops=%d", stops)
+	}
+}
+
+func TestCenterPositionInWorkAreas(t *testing.T) {
+	cases := []struct {
+		name                     string
+		left, top, right, bottom int
+		width, height            int
+		wantX, wantY             int
+	}{
+		{"primary", 0, 0, 1920, 1080, 340, 220, 790, 430},
+		{"secondary negative origin", -1600, 0, 0, 900, 400, 300, -1000, 300},
+		{"window larger than work area", 100, 50, 500, 300, 600, 400, 100, 50},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			x, y := centerPositionInArea(tc.left, tc.top, tc.right, tc.bottom, tc.width, tc.height)
+			if x != tc.wantX || y != tc.wantY {
+				t.Fatalf("center=(%d,%d), want=(%d,%d)", x, y, tc.wantX, tc.wantY)
+			}
+			if tc.width <= tc.right-tc.left && (x < tc.left || x+tc.width > tc.right) {
+				t.Fatalf("horizontal bounds exceeded: x=%d width=%d area=[%d,%d]", x, tc.width, tc.left, tc.right)
+			}
+			if tc.height <= tc.bottom-tc.top && (y < tc.top || y+tc.height > tc.bottom) {
+				t.Fatalf("vertical bounds exceeded: y=%d height=%d area=[%d,%d]", y, tc.height, tc.top, tc.bottom)
+			}
+		})
+	}
+}
+
+func TestPopupCenterSettingAppliedToWindowBackend(t *testing.T) {
+	p, _, _ := testPlugin(t, fixedNow())
+	fake := p.window.(*fakeWindow)
+	p.settings["popup_center"] = true
+	p.applyWindowSettings()
+	fake.mu.Lock()
+	centered := fake.popupCenter
+	fake.mu.Unlock()
+	if !centered {
+		t.Fatal("popup_center setting was not applied")
+	}
+	p.settings["popup_center"] = false
+	p.applyWindowSettings()
+	fake.mu.Lock()
+	centered = fake.popupCenter
+	fake.mu.Unlock()
+	if centered {
+		t.Fatal("popup_center false was not applied")
+	}
+}
+
+func TestV2RecordsWithoutOriginalSecondsAreBackfilled(t *testing.T) {
+	now := fixedNow()
+	dir := t.TempDir()
+	doc := storedFile{Version: 2, Timers: []storedTimer{
+		{ID: "running", Title: "运行中", CreatedAt: now.Format(time.RFC3339Nano), EndsAt: now.Add(25 * time.Second).Format(time.RFC3339Nano), Status: statusRunning},
+		{ID: "pending", Title: "待确认", CreatedAt: now.Add(-60 * time.Second).Format(time.RFC3339Nano), EndsAt: now.Add(-35 * time.Second).Format(time.RFC3339Nano), Status: statusPending, EndedAt: now.Add(-35 * time.Second).Format(time.RFC3339Nano), NextReminderAt: now.Add(time.Minute).Format(time.RFC3339Nano)},
+	}}
+	data, _ := json.Marshal(doc)
+	if err := os.WriteFile(filepath.Join(dir, dataFileName), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := newPlugin(&bytes.Buffer{}, dir, func() time.Time { return now }, nil)
+	p.sound = &fakeSound{}
+	p.settings["floating_window"] = false
+	p.load()
+	if p.timers["running"].OriginalSeconds != 25 || p.timers["pending"].OriginalSeconds != 25 {
+		t.Fatalf("original duration backfill: running=%+v pending=%+v", p.timers["running"], p.timers["pending"])
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, dataFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"originalSeconds": 25`) {
+		t.Fatalf("backfilled originalSeconds not persisted: %s", raw)
+	}
+}
+
+func TestListActionsExposePauseResumeRestart(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	p.settings["sound_enabled"] = false
+	p.startTimer("运行中", 60)
+	id := p.timerListLocked()[0].ID
+	items, _ := p.query("")
+	actions := items[0]["actions"].([]map[string]any)
+	if len(actions) != 3 || actions[0]["id"] != "cancel" || actions[1]["id"] != "pause" || actions[2]["id"] != "restart" {
+		t.Fatalf("running actions: %#v", actions)
+	}
+	p.pauseTimer(id)
+	items, _ = p.query("")
+	actions = items[0]["actions"].([]map[string]any)
+	if len(actions) != 2 || actions[0]["id"] != "resume" || actions[1]["id"] != "cancel" {
+		t.Fatalf("paused actions: %#v", actions)
+	}
+	p.resumeTimer(id)
+	p.processDue(current.Add(61 * time.Second))
+	items, _ = p.query("")
+	actions = items[0]["actions"].([]map[string]any)
+	if len(actions) != 3 || actions[0]["id"] != "acknowledge" || actions[1]["id"] != "snooze" || actions[2]["id"] != "restart" {
+		t.Fatalf("pending actions: %#v", actions)
+	}
+}
+
+func TestAcknowledgeActionStopsCurrentSound(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	fake := &fakeSound{}
+	p.sound = fake
+	p.settings["sound_enabled"] = true
+	p.startTimer("列表确认", 1)
+	id := p.timerListLocked()[0].ID
+	p.processDue(current.Add(time.Second))
+	p.acknowledgeTimer(id)
+	_, _, stops := fake.snapshot()
+	if stops != 1 {
+		t.Fatalf("list acknowledge stop count=%d want=1", stops)
+	}
+}
+
+func TestRestartPendingStopsCurrentSound(t *testing.T) {
+	current := fixedNow()
+	p, _, _ := testPlugin(t, current)
+	p.now = func() time.Time { return current }
+	fake := &fakeSound{}
+	p.sound = fake
+	p.settings["sound_enabled"] = true
+	p.startTimer("重新开始", 2)
+	id := p.timerListLocked()[0].ID
+	p.processDue(current.Add(2 * time.Second))
+	p.restartTimer(id)
+	_, _, stops := fake.snapshot()
+	if stops != 1 {
+		t.Fatalf("pending restart stop count=%d want=1", stops)
+	}
+	if p.timers[id].Status != statusRunning {
+		t.Fatalf("pending restart state=%q want running", p.timers[id].Status)
 	}
 }
