@@ -30,7 +30,7 @@ const (
 	islandWheelDelta    = 120
 	islandBaseWidth     = islandCollapsedWidth
 	islandBaseHeight    = 36
-	islandRowHeight     = 64
+	islandRowHeight     = 52
 	islandMaxRows       = 6
 )
 
@@ -538,12 +538,6 @@ func (b *islandWinBackend) handleClick(x, y int) {
 		if y < top || y >= top+rowHeight {
 			continue
 		}
-		// Only the lower action line is clickable; the centered timer line
-		// above it is inert. The two actions split at the panel center,
-		// matching how they are drawn.
-		if y < top+scaleInt(b.dpi, 31) {
-			return
-		}
 		item := items[itemIndex]
 		first, second := islandRowActions(item.Status)
 		if x < b.width/2 {
@@ -632,7 +626,7 @@ func (b *islandWinBackend) paint() {
 		model := buildIslandViewModel(b.items, b.hasPending, true, false, time.Now())
 		drawIslandText(hdc, model.CollapsedText, rect{left: 0, top: 0, right: client.right, bottom: client.bottom}, dtCenter|dtVCenter|dtSingleLine)
 	} else {
-		drawIslandText(hdc, "倒计时", rect{left: int32(scaleInt(b.dpi, 16)), top: int32(scaleInt(b.dpi, 8)), right: client.right, bottom: int32(scaleInt(b.dpi, 42))}, dtLeft|dtVCenter|dtSingleLine)
+		drawIslandText(hdc, "倒计时", rect{left: 0, top: int32(scaleInt(b.dpi, 8)), right: client.right, bottom: int32(scaleInt(b.dpi, 42))}, dtCenter|dtVCenter|dtSingleLine)
 		if divBrush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x002A2A2A)); divBrush != 0 {
 			divRect := rect{left: int32(scaleInt(b.dpi, 12)), top: int32(scaleInt(b.dpi, 48)), right: client.right - int32(scaleInt(b.dpi, 12)), bottom: int32(scaleInt(b.dpi, 48)) + 1}
 			islandProcFillRect.Call(hdc, uintptr(unsafe.Pointer(&divRect)), divBrush)
@@ -645,7 +639,7 @@ func (b *islandWinBackend) paint() {
 			cardLeft := int32(scaleInt(b.dpi, 10))
 			cardRight := int32(b.width - scaleInt(b.dpi, 10))
 			cardTop := int32(top + scaleInt(b.dpi, 4))
-			cardBottom := int32(top + scaleInt(b.dpi, 60))
+			cardBottom := int32(top + scaleInt(b.dpi, 48))
 			cardCorner := int32(scaleInt(b.dpi, 20))
 			// Row card: slightly lighter fill + 1px border.
 			if cardBrush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x00202020)); cardBrush != 0 {
@@ -672,7 +666,9 @@ func (b *islandWinBackend) paint() {
 			if status == statusPending {
 				islandProcSetTextColor.Call(hdc, orange)
 			}
-			drawIslandText(hdc, item.Title+"  "+sub, rect{left: cardLeft, top: cardTop + int32(scaleInt(b.dpi, 3)), right: cardRight, bottom: cardTop + int32(scaleInt(b.dpi, 27))}, dtCenter|dtVCenter|dtSingleLine|dtEndEllipsis)
+			// Single line per row: timer on the left, the two actions
+			// right-aligned in their click zones on the same line.
+			drawIslandText(hdc, item.Title+"  "+sub, rect{left: cardLeft + int32(scaleInt(b.dpi, 4)), top: cardTop, right: int32(b.width - scaleInt(b.dpi, 170)), bottom: cardBottom}, dtLeft|dtVCenter|dtSingleLine|dtEndEllipsis)
 			if status == statusPending {
 				islandProcSetTextColor.Call(hdc, white)
 			}
@@ -683,9 +679,8 @@ func (b *islandWinBackend) paint() {
 			case statusPending:
 				left, right = "已知晓", "稍后提醒"
 			}
-			mid := int32(b.width / 2)
-			drawIslandText(hdc, left, rect{left: cardLeft, top: cardTop + int32(scaleInt(b.dpi, 27)), right: mid, bottom: cardTop + int32(scaleInt(b.dpi, 51))}, dtCenter|dtVCenter|dtSingleLine)
-			drawIslandText(hdc, right, rect{left: mid, top: cardTop + int32(scaleInt(b.dpi, 27)), right: cardRight, bottom: cardTop + int32(scaleInt(b.dpi, 51))}, dtCenter|dtVCenter|dtSingleLine)
+			drawIslandText(hdc, left, rect{left: int32(b.scale(170)), top: cardTop, right: int32(b.scale(247)), bottom: cardBottom}, dtRight|dtVCenter|dtSingleLine)
+			drawIslandText(hdc, right, rect{left: int32(b.scale(255)), top: cardTop, right: cardRight - int32(scaleInt(b.dpi, 8)), bottom: cardBottom}, dtRight|dtVCenter|dtSingleLine)
 		}
 		if divBrush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x002A2A2A)); divBrush != 0 {
 			divRect := rect{left: int32(scaleInt(b.dpi, 12)), top: client.bottom - int32(scaleInt(b.dpi, 42)), right: client.right - int32(scaleInt(b.dpi, 12)), bottom: client.bottom - int32(scaleInt(b.dpi, 42)) + 1}
