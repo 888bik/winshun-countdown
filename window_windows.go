@@ -49,6 +49,7 @@ const (
 	sifPos           = 0x0004
 	dtLeft           = 0x0000
 	dtCenter         = 0x0001
+	dtRight          = 0x0002
 	dtVCenter        = 0x0004
 	dtSingleLine     = 0x0020
 	dtEndEllipsis    = 0x8000

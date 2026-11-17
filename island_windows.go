@@ -405,7 +405,11 @@ func (b *islandWinBackend) layout() {
 	screenW, _, _ := islandProcGetSystemMetrics.Call(0)
 	x := (int(screenW) - b.width) / 2
 	y := 0
-	region, _, _ := islandProcCreateRoundRectRgn.Call(0, 0, uintptr(b.width+1), uintptr(b.height+1), uintptr(b.scale(22)), uintptr(b.scale(22)))
+	corner := b.scale(36)
+	if b.expanded {
+		corner = b.scale(56)
+	}
+	region, _, _ := islandProcCreateRoundRectRgn.Call(0, 0, uintptr(b.width+1), uintptr(b.height+1), uintptr(corner), uintptr(corner))
 	if region != 0 {
 		if result, _, _ := islandProcSetWindowRgn.Call(b.hwnd, region, 1); result == 0 {
 			islandProcDeleteObject.Call(region)
@@ -419,7 +423,7 @@ func (b *islandWinBackend) layout() {
 	if b.font != 0 {
 		islandProcDeleteObject.Call(b.font)
 	}
-	b.font, _, _ = islandProcCreateFont.Call(uintptr(-b.scale(15)), 0, 0, 0, 500, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(mustUTF16("Segoe UI"))))
+	b.font, _, _ = islandProcCreateFont.Call(uintptr(-b.scale(16)), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(mustUTF16("Segoe UI"))))
 	if result, _, _ := islandProcSetWindowPos.Call(b.hwnd, 0, uintptr(x), uintptr(y), uintptr(b.width), uintptr(b.height), islandSWPNoActivate|islandSWPNoZOrder|islandSWPShowWindow); result == 0 {
 		b.failOnGUI()
 		return
@@ -522,22 +526,44 @@ func (b *islandWinBackend) paint() {
 	defer islandProcEndPaint.Call(b.hwnd, uintptr(unsafe.Pointer(&ps)))
 	var client rect
 	islandProcGetClientRect.Call(b.hwnd, uintptr(unsafe.Pointer(&client)))
-	dark := uintptr(0x00141414)
-	if b.hasPending {
-		dark = uintptr(0x00008CFF)
-	}
-	brush, _, _ := islandProcCreateSolidBrush.Call(dark)
+	// The pill stays near-black in every state; an expired timer is signalled
+	// by orange text plus the alpha pulse, not a full orange fill.
+	brush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x00141414))
 	if brush != 0 {
 		islandProcFillRect.Call(hdc, uintptr(unsafe.Pointer(&client)), brush)
 		islandProcDeleteObject.Call(brush)
+	}
+	// Subtle 1px outline so the pill reads against dark wallpapers.
+	corner := b.scale(36)
+	if b.expanded {
+		corner = b.scale(56)
+	}
+	if pen, _, _ := islandProcCreatePen.Call(0, 1, uintptr(0x00353535)); pen != 0 {
+		nullBrush, _, _ := islandProcGetStockObject.Call(5)
+		oldPen, _, _ := islandProcSelectObject.Call(hdc, pen)
+		var oldBrush uintptr
+		if nullBrush != 0 {
+			oldBrush, _, _ = islandProcSelectObject.Call(hdc, nullBrush)
+		}
+		islandProcRoundRect.Call(hdc, 0, 0, uintptr(client.right), uintptr(client.bottom), uintptr(corner), uintptr(corner))
+		if nullBrush != 0 {
+			islandProcSelectObject.Call(hdc, oldBrush)
+		}
+		islandProcSelectObject.Call(hdc, oldPen)
+		islandProcDeleteObject.Call(pen)
 	}
 	oldFont := uintptr(0)
 	if b.font != 0 {
 		oldFont, _, _ = islandProcSelectObject.Call(hdc, b.font)
 	}
 	islandProcSetBkMode.Call(hdc, 1)
-	islandProcSetTextColor.Call(hdc, 0x00FFFFFF)
+	white := uintptr(0x00FFFFFF)
+	orange := uintptr(0x00008CFF)
+	islandProcSetTextColor.Call(hdc, white)
 	if !b.expanded {
+		if b.hasPending {
+			islandProcSetTextColor.Call(hdc, orange)
+		}
 		model := buildIslandViewModel(b.items, b.hasPending, true, false, time.Now())
 		drawIslandText(hdc, model.CollapsedText, rect{left: 0, top: 0, right: client.right, bottom: client.bottom}, dtCenter|dtVCenter|dtSingleLine)
 	} else {
@@ -547,7 +573,8 @@ func (b *islandWinBackend) paint() {
 			item := items[itemIndex]
 			top := scaleInt(b.dpi, 58) + visibleIndex*scaleInt(b.dpi, islandRowHeight)
 			sub := ""
-			switch normalizedTrayStatus(item.Status) {
+			status := normalizedTrayStatus(item.Status)
+			switch status {
 			case statusRunning:
 				sub = formatRemaining(item.EndsAt, time.Now())
 			case statusPaused:
@@ -555,21 +582,27 @@ func (b *islandWinBackend) paint() {
 			case statusPending:
 				sub = "已到期"
 			}
+			if status == statusPending {
+				islandProcSetTextColor.Call(hdc, orange)
+			}
 			drawIslandText(hdc, item.Title+"  "+sub, rect{left: int32(scaleInt(b.dpi, 14)), top: int32(top), right: int32(b.width - scaleInt(b.dpi, 170)), bottom: int32(top + scaleInt(b.dpi, 30))}, dtLeft|dtVCenter|dtSingleLine|dtEndEllipsis)
+			if status == statusPending {
+				islandProcSetTextColor.Call(hdc, white)
+			}
 			left, right := "暂停", "取消"
-			switch normalizedTrayStatus(item.Status) {
+			switch status {
 			case statusPaused:
 				left, right = "继续", "取消"
 			case statusPending:
 				left, right = "已知晓", "稍后提醒"
 			}
-			drawIslandText(hdc, left+"   "+right, rect{left: int32(b.width - scaleInt(b.dpi, 165)), top: int32(top), right: client.right - int32(scaleInt(b.dpi, 8)), bottom: int32(top + scaleInt(b.dpi, 30))}, dtLeft|dtVCenter|dtSingleLine)
+			drawIslandText(hdc, left, rect{left: int32(b.scale(170)), top: int32(top), right: int32(b.scale(247)), bottom: int32(top + scaleInt(b.dpi, 30))}, dtRight|dtVCenter|dtSingleLine)
+			drawIslandText(hdc, right, rect{left: int32(b.scale(255)), top: int32(top), right: client.right - int32(scaleInt(b.dpi, 8)), bottom: int32(top + scaleInt(b.dpi, 30))}, dtRight|dtVCenter|dtSingleLine)
 		}
-		footer := "打开列表                 全部已知晓"
-		if !b.hasPending {
-			footer = "打开列表                 "
+		drawIslandText(hdc, "打开列表", rect{left: int32(scaleInt(b.dpi, 12)), top: client.bottom - int32(scaleInt(b.dpi, 38)), right: int32(b.width / 2), bottom: client.bottom}, dtLeft|dtVCenter|dtSingleLine)
+		if b.hasPending {
+			drawIslandText(hdc, "全部已知晓", rect{left: int32(b.width / 2), top: client.bottom - int32(scaleInt(b.dpi, 38)), right: client.right - int32(scaleInt(b.dpi, 12)), bottom: client.bottom}, dtRight|dtVCenter|dtSingleLine)
 		}
-		drawIslandText(hdc, footer, rect{left: int32(scaleInt(b.dpi, 12)), top: client.bottom - int32(scaleInt(b.dpi, 38)), right: client.right - int32(scaleInt(b.dpi, 12)), bottom: client.bottom}, dtLeft|dtVCenter|dtSingleLine)
 	}
 	if oldFont != 0 {
 		islandProcSelectObject.Call(hdc, oldFont)
