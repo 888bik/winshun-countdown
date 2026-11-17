@@ -253,7 +253,7 @@ func (b *islandWinBackend) ensureWindow() bool {
 	b.dpi = b.getDPI()
 	// A rounded native region keeps the transparent corners click-through. The
 	// layered alpha is uniform; all drawing remains on the GUI thread.
-	if result, _, _ := islandProcSetLayeredWindowAttributes.Call(hwnd, 0, 238, 0x2); result == 0 {
+	if result, _, _ := islandProcSetLayeredWindowAttributes.Call(hwnd, 0, 255, 0x2); result == 0 {
 		return false
 	}
 	return true
@@ -289,21 +289,21 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 			case 2:
 				// Warm orange breathing pulse while at least one timer awaits acknowledgement.
 				phase := float64(time.Now().UnixNano()%int64(1400*time.Millisecond)) / float64(1400*time.Millisecond)
-				alpha := byte(190 + int(45*(0.5+0.5*math.Sin(phase*2*math.Pi))))
+				alpha := byte(245 + int(10*(0.5+0.5*math.Sin(phase*2*math.Pi))))
 				islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
 			case 3:
 				progress, done := activeIsland.anim.progress(time.Now())
-				alpha := byte(216 + int(22*progress))
+				alpha := byte(237 + int(18*progress))
 				if activeIsland.anim.kind == animExit {
-					alpha = byte(238 - int(22*progress))
+					alpha = byte(255 - int(18*progress))
 				}
 				islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
 				activeIsland.applyAnimFrame(progress)
 				if done {
 					islandProcKillTimer.Call(hwnd, 3)
 					activeIsland.animating = false
-					activeIsland.alpha = 238
-					islandProcSetLayeredWindowAttributes.Call(hwnd, 0, 238, 0x2)
+					activeIsland.alpha = 255
+					islandProcSetLayeredWindowAttributes.Call(hwnd, 0, 255, 0x2)
 					activeIsland.layout()
 				}
 			case islandTimerTick:
@@ -407,8 +407,8 @@ func (b *islandWinBackend) updateVisibility() {
 		islandProcSetTimer.Call(b.hwnd, 2, 80, 0)
 	} else {
 		islandProcKillTimer.Call(b.hwnd, 2)
-		b.alpha = 238
-		islandProcSetLayeredWindowAttributes.Call(b.hwnd, 0, 238, 0x2)
+		b.alpha = 255
+		islandProcSetLayeredWindowAttributes.Call(b.hwnd, 0, 255, 0x2)
 	}
 	b.layout()
 	// One-second tick: the collapsed text and the expanded rows show the
@@ -540,7 +540,12 @@ func (b *islandWinBackend) handleClick(x, y int) {
 		}
 		item := items[itemIndex]
 		first, second := islandRowActions(item.Status)
-		if x < b.width/2 {
+		actionStart := b.scale(165)
+		actionSplit := b.scale(250)
+		if x < actionStart {
+			return
+		}
+		if x < actionSplit {
 			b.invoke(item.ID, first)
 		} else {
 			b.invoke(item.ID, second)
