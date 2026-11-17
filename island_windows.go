@@ -20,6 +20,7 @@ const (
 	islandTMEHover      = 0x00000001
 	islandTMELeave      = 0x00000002
 	islandTimerLeave    = uintptr(1)
+	islandTimerTick     = uintptr(4)
 	islandExNoActivate  = 0x08000000
 	islandExLayered     = 0x00080000
 	islandWSPopup       = 0x80000000
@@ -118,6 +119,13 @@ type islandWinBackend struct {
 	anim          animation
 	animating     bool
 	alpha         int
+	corner        int
+	animFromW     int
+	animFromH     int
+	animFromC     int
+	animToW       int
+	animToH       int
+	animToC       int
 	failed        bool
 }
 
@@ -264,7 +272,6 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 			activeIsland.trackMouse()
 		case islandWMMouseHover:
 			activeIsland.expanded = true
-			activeIsland.layout()
 			activeIsland.startIslandAnimation(animEnter)
 			return 0
 		case islandWMMouseLeave:
@@ -277,7 +284,6 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 				islandProcKillTimer.Call(hwnd, islandTimerLeave)
 				if !activeIsland.pointerInside() {
 					activeIsland.expanded = false
-					activeIsland.layout()
 					activeIsland.startIslandAnimation(animExit)
 				}
 			case 2:
@@ -287,14 +293,21 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 				islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
 			case 3:
 				progress, done := activeIsland.anim.progress(time.Now())
-				alpha := byte(160 + int(78*progress))
+				alpha := byte(216 + int(22*progress))
+				if activeIsland.anim.kind == animExit {
+					alpha = byte(238 - int(22*progress))
+				}
 				islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
+				activeIsland.applyAnimFrame(progress)
 				if done {
 					islandProcKillTimer.Call(hwnd, 3)
 					activeIsland.animating = false
 					activeIsland.alpha = 238
 					islandProcSetLayeredWindowAttributes.Call(hwnd, 0, 238, 0x2)
+					activeIsland.layout()
 				}
+			case islandTimerTick:
+				islandProcInvalidateRect.Call(hwnd, 0, 1)
 			}
 			return 0
 		case wmDpiChanged:
@@ -345,15 +358,38 @@ func (b *islandWinBackend) startIslandAnimation(kind int) {
 	if b.hwnd == 0 {
 		return
 	}
+	// A new animation starts from the current size, so reversing mid-flight
+	// (hover back in during collapse) stays smooth instead of jumping.
+	b.cancelIslandAnimation()
+	toW, toH, toC := b.islandTargetSize()
+	fromC := b.corner
+	if fromC == 0 {
+		fromC = b.scale(36)
+	}
+	b.animFromW, b.animFromH, b.animFromC = b.width, b.height, fromC
+	b.animToW, b.animToH, b.animToC = toW, toH, toC
 	duration := animationEnterDuration
-	from, to := 0.72, 1.0
 	if kind == animExit {
 		duration = animationExitDuration
-		from, to = 1.0, 0.72
 	}
-	b.anim.begin(kind, time.Now(), duration, from, to)
+	b.anim.begin(kind, time.Now(), duration, 0, 1)
 	b.animating = true
 	islandProcSetTimer.Call(b.hwnd, 3, animationFrameInterval, 0)
+}
+
+func (b *islandWinBackend) cancelIslandAnimation() {
+	if b.hwnd != 0 && b.animating {
+		islandProcKillTimer.Call(b.hwnd, 3)
+	}
+	b.animating = false
+	b.anim.stop()
+}
+
+func (b *islandWinBackend) applyAnimFrame(progress float64) {
+	w := b.animFromW + int(float64(b.animToW-b.animFromW)*progress)
+	h := b.animFromH + int(float64(b.animToH-b.animFromH)*progress)
+	c := b.animFromC + int(float64(b.animToC-b.animFromC)*progress)
+	b.applyIslandSize(w, h, c)
 }
 
 func (b *islandWinBackend) updateVisibility() {
@@ -375,6 +411,10 @@ func (b *islandWinBackend) updateVisibility() {
 		islandProcSetLayeredWindowAttributes.Call(b.hwnd, 0, 238, 0x2)
 	}
 	b.layout()
+	// One-second tick: the collapsed text and the expanded rows show the
+	// remaining time computed at paint time, so invalidating once a second
+	// makes the island count down live instead of only on scheduler wakes.
+	islandProcSetTimer.Call(b.hwnd, islandTimerTick, 1000, 0)
 }
 
 func (b *islandWinBackend) hideOnGUI() {
@@ -384,15 +424,17 @@ func (b *islandWinBackend) hideOnGUI() {
 	if b.hwnd != 0 {
 		islandProcKillTimer.Call(b.hwnd, 2)
 		islandProcKillTimer.Call(b.hwnd, 3)
+		islandProcKillTimer.Call(b.hwnd, islandTimerTick)
 		islandProcShowWindow.Call(b.hwnd, swHide)
 	}
 }
 
-func (b *islandWinBackend) layout() {
-	if b.hwnd == 0 {
-		return
-	}
-	width, height := islandBaseWidth, islandBaseHeight
+// islandTargetSize returns the window size and corner ellipse for the current
+// expanded state, in scaled pixels. The size animation interpolates between
+// two such targets.
+func (b *islandWinBackend) islandTargetSize() (width, height, corner int) {
+	width, height = islandBaseWidth, islandBaseHeight
+	corner = 36
 	if b.expanded {
 		width = islandExpandedWidth
 		rows := len(b.visibleItems())
@@ -400,15 +442,19 @@ func (b *islandWinBackend) layout() {
 			rows = islandMaxRows
 		}
 		height = 58 + rows*islandRowHeight + 42
+		corner = 56
 	}
-	b.width, b.height = b.scale(width), b.scale(height)
+	return b.scale(width), b.scale(height), b.scale(corner)
+}
+
+func (b *islandWinBackend) applyIslandSize(width, height, corner int) {
+	if b.hwnd == 0 {
+		return
+	}
+	b.width, b.height, b.corner = width, height, corner
 	screenW, _, _ := islandProcGetSystemMetrics.Call(0)
 	x := (int(screenW) - b.width) / 2
 	y := 0
-	corner := b.scale(36)
-	if b.expanded {
-		corner = b.scale(56)
-	}
 	region, _, _ := islandProcCreateRoundRectRgn.Call(0, 0, uintptr(b.width+1), uintptr(b.height+1), uintptr(corner), uintptr(corner))
 	if region != 0 {
 		if result, _, _ := islandProcSetWindowRgn.Call(b.hwnd, region, 1); result == 0 {
@@ -420,10 +466,6 @@ func (b *islandWinBackend) layout() {
 		b.failOnGUI()
 		return
 	}
-	if b.font != 0 {
-		islandProcDeleteObject.Call(b.font)
-	}
-	b.font, _, _ = islandProcCreateFont.Call(uintptr(-b.scale(16)), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(mustUTF16("Segoe UI"))))
 	if result, _, _ := islandProcSetWindowPos.Call(b.hwnd, 0, uintptr(x), uintptr(y), uintptr(b.width), uintptr(b.height), islandSWPNoActivate|islandSWPNoZOrder|islandSWPShowWindow); result == 0 {
 		b.failOnGUI()
 		return
@@ -431,6 +473,23 @@ func (b *islandWinBackend) layout() {
 	islandProcInvalidateRect.Call(b.hwnd, 0, 1)
 	islandProcShowWindow.Call(b.hwnd, swShowNoActivate)
 	b.visible.Store(true)
+}
+
+func (b *islandWinBackend) layout() {
+	if b.hwnd == 0 {
+		return
+	}
+	// A snap (refresh, DPI change, scroll) wins over any in-flight animation.
+	b.cancelIslandAnimation()
+	w, h, corner := b.islandTargetSize()
+	b.applyIslandSize(w, h, corner)
+	if b.failed {
+		return
+	}
+	if b.font != 0 {
+		islandProcDeleteObject.Call(b.font)
+	}
+	b.font, _, _ = islandProcCreateFont.Call(uintptr(-b.scale(16)), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(mustUTF16("Segoe UI"))))
 }
 
 func (b *islandWinBackend) visibleItems() []trayTimerSnapshot {
@@ -467,7 +526,7 @@ func (b *islandWinBackend) pointerInside() bool {
 func (b *islandWinBackend) handleClick(x, y int) {
 	if !b.expanded {
 		b.expanded = true
-		b.layout()
+		b.startIslandAnimation(animEnter)
 		return
 	}
 	rowHeight := b.scale(islandRowHeight)
