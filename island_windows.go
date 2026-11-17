@@ -996,7 +996,7 @@ func (b *islandWinBackend) paint() {
 				islandProcSetTextColor.Call(hdc, orange)
 			}
 			// Single line per row: timer on the left, the two actions
-			// right-aligned in their click zones on the same line.
+			// centred in their click zones on the same line.
 			drawIslandText(hdc, item.Title+"  "+sub, rect{left: cardLeft + int32(scaleInt(b.dpi, 4)), top: cardTop, right: int32(b.width - scaleInt(b.dpi, 170)), bottom: cardBottom}, dtLeft|dtVCenter|dtSingleLine|dtEndEllipsis)
 			if status == statusPending {
 				islandProcSetTextColor.Call(hdc, white)
@@ -1011,21 +1011,43 @@ func (b *islandWinBackend) paint() {
 			firstRect := rect{left: int32(b.scale(islandActionStartX)), top: cardTop, right: int32(b.scale(islandActionSplitX)), bottom: cardBottom}
 			secondRect := rect{left: int32(b.scale(islandActionSplitX)), top: cardTop, right: cardRight - int32(scaleInt(b.dpi, 8)), bottom: cardBottom}
 			if visibleIndex == b.hoverRow && b.leavingID == "" && (b.hoverHalf == 0 || b.hoverHalf == 1) {
-				label, rightEdge := left, firstRect.right
+				// The label is centred in its own action zone and the pill
+				// is centred on the label (6px padding each side), clamped
+				// inside the zone so it never reaches into the other
+				// action's label. The previous right-aligned pill put all
+				// its padding on the left and overlapped the first action.
+				label, zone := left, firstRect
 				if b.hoverHalf == 1 {
-					label, rightEdge = right, secondRect.right
+					label, zone = right, secondRect
 				}
-				pillWidth := int32(b.textExtent(hdc, label) + 2*scaleInt(b.dpi, 10))
+				pad := int32(scaleInt(b.dpi, 6))
+				textW := int32(b.textExtent(hdc, label))
+				textLeft := zone.left + (zone.right-zone.left-textW)/2
 				pillHeight := int32(scaleInt(b.dpi, 28))
 				pillRect := rect{
-					left: rightEdge - pillWidth, top: cardTop + (cardBottom-cardTop-pillHeight)/2,
-					right: rightEdge, bottom: cardTop + (cardBottom-cardTop-pillHeight)/2 + pillHeight,
+					left: textLeft - pad, top: cardTop + (cardBottom-cardTop-pillHeight)/2,
+					right: textLeft + textW + pad, bottom: cardTop + (cardBottom-cardTop-pillHeight)/2 + pillHeight,
+				}
+				if b.hoverHalf == 0 {
+					if pillRect.right > firstRect.right-2 {
+						pillRect.right = firstRect.right - 2
+					}
+				} else {
+					if pillRect.left < secondRect.left+2 {
+						pillRect.left = secondRect.left + 2
+					}
+				}
+				if pillRect.right > cardRight-2 {
+					pillRect.right = cardRight - 2
+				}
+				if pillRect.left < cardLeft+2 {
+					pillRect.left = cardLeft + 2
 				}
 				if pill, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x003A3A3A)); pill != 0 {
-					if pen, _, _ := islandProcCreatePen.Call(0, 1, uintptr(0x004A4A4A)); pen != 0 {
+					if pen, _, _ := islandProcCreatePen.Call(0, 1, uintptr(0x005A5A5A)); pen != 0 {
 						oldPen, _, _ := islandProcSelectObject.Call(hdc, pen)
 						oldBrush, _, _ := islandProcSelectObject.Call(hdc, pill)
-						islandProcRoundRect.Call(hdc, uintptr(pillRect.left), uintptr(pillRect.top), uintptr(pillRect.right), uintptr(pillRect.bottom), uintptr(scaleInt(b.dpi, 12)), uintptr(scaleInt(b.dpi, 12)))
+						islandProcRoundRect.Call(hdc, uintptr(pillRect.left), uintptr(pillRect.top), uintptr(pillRect.right), uintptr(pillRect.bottom), uintptr(scaleInt(b.dpi, 14)), uintptr(scaleInt(b.dpi, 14)))
 						islandProcSelectObject.Call(hdc, oldBrush)
 						islandProcSelectObject.Call(hdc, oldPen)
 						islandProcDeleteObject.Call(pen)
@@ -1033,8 +1055,8 @@ func (b *islandWinBackend) paint() {
 					islandProcDeleteObject.Call(pill)
 				}
 			}
-			drawIslandText(hdc, left, firstRect, dtRight|dtVCenter|dtSingleLine)
-			drawIslandText(hdc, right, secondRect, dtRight|dtVCenter|dtSingleLine)
+			drawIslandText(hdc, left, firstRect, dtCenter|dtVCenter|dtSingleLine)
+			drawIslandText(hdc, right, secondRect, dtCenter|dtVCenter|dtSingleLine)
 		}
 		if divBrush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x002A2A2A)); divBrush != 0 {
 			divRect := rect{left: int32(scaleInt(b.dpi, 12)), top: client.bottom - int32(scaleInt(b.dpi, 42)), right: client.right - int32(scaleInt(b.dpi, 12)), bottom: client.bottom - int32(scaleInt(b.dpi, 42)) + 1}
