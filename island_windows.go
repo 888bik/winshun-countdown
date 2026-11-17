@@ -470,6 +470,7 @@ func (b *islandWinBackend) hideOnGUI() {
 	b.expanded = false
 	b.scroll = 0
 	if b.hwnd != 0 {
+		islandProcKillTimer.Call(b.hwnd, islandTimerLeave)
 		islandProcKillTimer.Call(b.hwnd, islandTimerPulse)
 		islandProcKillTimer.Call(b.hwnd, islandTimerAnim)
 		islandProcKillTimer.Call(b.hwnd, islandTimerTick)
@@ -593,8 +594,18 @@ func (b *islandWinBackend) islandTargetSize() (width, height, corner int) {
 	return b.scale(width), b.scale(height), b.scale(corner)
 }
 
+func (b *islandWinBackend) islandModelVisible() bool {
+	return buildIslandViewModel(b.items, b.hasPending, true, b.expanded, time.Now()).Visible
+}
+
 func (b *islandWinBackend) applyIslandSize(width, height, corner int) {
 	if b.hwnd == 0 {
+		return
+	}
+	// A late animation frame or 300ms leave timer can arrive after the last
+	// pending item was confirmed. Never resurrect an empty island.
+	if !b.islandModelVisible() {
+		b.hideOnGUI()
 		return
 	}
 	b.width, b.height, b.corner = width, height, corner
@@ -717,6 +728,10 @@ func (b *islandWinBackend) stepLeave() {
 	}
 	progress, done := islandLeaveFraction(b.leaveStart, time.Now())
 	b.leaveProgress = progress
+	if !b.islandModelVisible() {
+		b.hideOnGUI()
+		return
+	}
 	islandProcInvalidateRect.Call(b.hwnd, 0, 0)
 	w, h, c := b.islandTargetSize()
 	b.applyIslandSize(w, h, c)
@@ -737,7 +752,27 @@ func (b *islandWinBackend) finishLeave() {
 	}
 	// Clear our state before invoking: the callback may synchronously
 	// Refresh/Hide, and must not be able to settle this action twice.
+	if action == "acknowledge" {
+		// Drop the row from the local snapshot immediately so a late
+		// animation frame cannot paint an empty expanded panel before the
+		// asynchronous Refresh arrives.
+		filtered := b.items[:0]
+		for _, item := range b.items {
+			if item.ID != id {
+				filtered = append(filtered, item)
+			}
+		}
+		b.items = filtered
+		b.hasPending = false
+		for _, item := range b.items {
+			if normalizedTrayStatus(item.Status) == statusPending {
+				b.hasPending = true
+				break
+			}
+		}
+	}
 	b.invoke(id, action)
+	b.updateVisibility()
 }
 
 func (b *islandWinBackend) leavingVisibleIndex() int {
@@ -931,7 +966,9 @@ func (b *islandWinBackend) paint() {
 			cardFill := uintptr(0x00202020)
 			cardBorder := uintptr(0x00333333)
 			if visibleIndex == b.hoverRow && b.leavingID == "" {
-				cardFill, cardBorder = 0x002C2C2C, 0x004A4A4A
+				// Only the border changes; the card surface stays put so the
+				// small action pill is the single hover target.
+				cardBorder = 0x004A4A4A
 			}
 			// Row card: slightly lighter fill + 1px border.
 			if cardBrush, _, _ := islandProcCreateSolidBrush.Call(cardFill); cardBrush != 0 {
@@ -973,18 +1010,27 @@ func (b *islandWinBackend) paint() {
 			}
 			firstRect := rect{left: int32(b.scale(islandActionStartX)), top: cardTop, right: int32(b.scale(islandActionSplitX)), bottom: cardBottom}
 			secondRect := rect{left: int32(b.scale(islandActionSplitX)), top: cardTop, right: cardRight - int32(scaleInt(b.dpi, 8)), bottom: cardBottom}
-			if visibleIndex == b.hoverRow && b.leavingID == "" {
-				pillRect := firstRect
+			if visibleIndex == b.hoverRow && b.leavingID == "" && (b.hoverHalf == 0 || b.hoverHalf == 1) {
+				label, rightEdge := left, firstRect.right
 				if b.hoverHalf == 1 {
-					pillRect = secondRect
+					label, rightEdge = right, secondRect.right
 				}
-				if b.hoverHalf == 0 || b.hoverHalf == 1 {
-					if pill, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x003A3A3A)); pill != 0 {
+				pillWidth := int32(b.textExtent(hdc, label) + 2*scaleInt(b.dpi, 10))
+				pillHeight := int32(scaleInt(b.dpi, 28))
+				pillRect := rect{
+					left: rightEdge - pillWidth, top: cardTop + (cardBottom-cardTop-pillHeight)/2,
+					right: rightEdge, bottom: cardTop + (cardBottom-cardTop-pillHeight)/2 + pillHeight,
+				}
+				if pill, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x003A3A3A)); pill != 0 {
+					if pen, _, _ := islandProcCreatePen.Call(0, 1, uintptr(0x004A4A4A)); pen != 0 {
+						oldPen, _, _ := islandProcSelectObject.Call(hdc, pen)
 						oldBrush, _, _ := islandProcSelectObject.Call(hdc, pill)
 						islandProcRoundRect.Call(hdc, uintptr(pillRect.left), uintptr(pillRect.top), uintptr(pillRect.right), uintptr(pillRect.bottom), uintptr(scaleInt(b.dpi, 12)), uintptr(scaleInt(b.dpi, 12)))
 						islandProcSelectObject.Call(hdc, oldBrush)
-						islandProcDeleteObject.Call(pill)
+						islandProcSelectObject.Call(hdc, oldPen)
+						islandProcDeleteObject.Call(pen)
 					}
+					islandProcDeleteObject.Call(pill)
 				}
 			}
 			drawIslandText(hdc, left, firstRect, dtRight|dtVCenter|dtSingleLine)
