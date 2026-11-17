@@ -21,23 +21,25 @@ import (
 )
 
 const (
-	appName         = "me.countdown"
-	displayName     = "倒计时"
-	dataFileName    = "countdown.json"
-	maxTimers       = 20
-	maxDuration     = int64(365 * 24 * 60 * 60)
-	tickInterval    = 1 * time.Second
-	repeatFirst     = 15 * time.Second
-	repeatEvery     = 60 * time.Second
-	dataVersion     = 2
-	statusRunning   = "running"
-	statusPending   = "pending_ack"
-	statusPaused    = "paused"
-	acknowledged    = "acknowledged"
-	preReminderLead = time.Minute
-	parseErrorText  = "时长看不懂，试试 25、25m、90s、1h30m、25:00。"
-	emptyTitle      = "目前没有正在运行的倒计时。"
-	emptyHint       = "输入 泡面 3 即可开始。"
+	islandCollapsedWidth = 200
+	islandExpandedWidth  = 340
+	appName              = "me.countdown"
+	displayName          = "倒计时"
+	dataFileName         = "countdown.json"
+	maxTimers            = 20
+	maxDuration          = int64(365 * 24 * 60 * 60)
+	tickInterval         = 1 * time.Second
+	repeatFirst          = 15 * time.Second
+	repeatEvery          = 60 * time.Second
+	dataVersion          = 2
+	statusRunning        = "running"
+	statusPending        = "pending_ack"
+	statusPaused         = "paused"
+	acknowledged         = "acknowledged"
+	preReminderLead      = time.Minute
+	parseErrorText       = "时长看不懂，试试 25、25m、90s、1h30m、25:00。"
+	emptyTitle           = "目前没有正在运行的倒计时。"
+	emptyHint            = "输入 泡面 3 即可开始。"
 )
 
 type timer struct {
@@ -71,6 +73,126 @@ type storedTimer struct {
 type storedFile struct {
 	Version int           `json:"version"`
 	Timers  []storedTimer `json:"timers"`
+}
+
+type islandCallbacks struct {
+	Pause    func(id string)
+	Resume   func(id string)
+	Restart  func(id string)
+	Cancel   func(id string)
+	Ack      func(id string)
+	Snooze   func(id string)
+	OpenList func()
+	AckAll   func()
+	Failed   func()
+}
+
+type islandBackend interface {
+	SetEnabled(enabled bool)
+	Refresh(items []trayTimerSnapshot, hasPending bool)
+	Hide()
+	Visible() bool
+}
+
+type islandViewModel struct {
+	Visible       bool
+	Expanded      bool
+	HasPending    bool
+	CollapsedText string
+	Width         int
+	Items         []trayTimerSnapshot
+}
+
+func islandRowActions(status string) (string, string) {
+	switch normalizedTrayStatus(status) {
+	case statusRunning:
+		return "pause", "cancel"
+	case statusPaused:
+		return "resume", "cancel"
+	case statusPending:
+		return "acknowledge", "snooze"
+	default:
+		return "", ""
+	}
+}
+
+func islandAckAllEnabled(hasPending bool) bool { return hasPending }
+
+func dispatchIslandAction(callbacks islandCallbacks, id, action string) {
+	switch action {
+	case "pause":
+		if callbacks.Pause != nil {
+			callbacks.Pause(id)
+		}
+	case "resume":
+		if callbacks.Resume != nil {
+			callbacks.Resume(id)
+		}
+	case "restart":
+		if callbacks.Restart != nil {
+			callbacks.Restart(id)
+		}
+	case "cancel":
+		if callbacks.Cancel != nil {
+			callbacks.Cancel(id)
+		}
+	case "acknowledge":
+		if callbacks.Ack != nil {
+			callbacks.Ack(id)
+		}
+	case "snooze":
+		if callbacks.Snooze != nil {
+			callbacks.Snooze(id)
+		}
+	}
+}
+
+func buildIslandViewModel(items []trayTimerSnapshot, hasPending, enabled, expanded bool, now time.Time) islandViewModel {
+	model := islandViewModel{HasPending: hasPending, Expanded: expanded, Width: islandCollapsedWidth, Items: append([]trayTimerSnapshot(nil), items...)}
+	if expanded {
+		model.Width = islandExpandedWidth
+	}
+	if !enabled {
+		return model
+	}
+	var earliest *trayTimerSnapshot
+	for i := range items {
+		item := &items[i]
+		if normalizedTrayStatus(item.Status) != statusRunning {
+			continue
+		}
+		if earliest == nil || item.EndsAt.Before(earliest.EndsAt) {
+			earliest = item
+		}
+	}
+	if earliest != nil {
+		model.Visible = true
+		model.CollapsedText = formatRemaining(earliest.EndsAt, now)
+	} else if hasPending {
+		model.Visible = true
+		model.CollapsedText = "已到期"
+	}
+	return model
+}
+
+type islandHoverState struct {
+	expanded bool
+	leaveAt  time.Time
+}
+
+func (s *islandHoverState) Hover()              { s.expanded = true; s.leaveAt = time.Time{} }
+func (s *islandHoverState) Leave(now time.Time) { s.leaveAt = now.Add(300 * time.Millisecond) }
+func (s *islandHoverState) Tick(now time.Time, pointerInside bool) bool {
+	if pointerInside {
+		s.leaveAt = time.Time{}
+		return false
+	}
+	if s.expanded && !s.leaveAt.IsZero() && !now.Before(s.leaveAt) {
+		s.expanded = false
+		s.leaveAt = time.Time{}
+		return true
+	}
+	return false
 }
 
 type windowCallbacks struct {
@@ -317,7 +439,9 @@ type Plugin struct {
 	interactionBusy int
 	deferredWindow  bool
 	windowBroken    bool
+	islandBroken    bool
 	window          windowBackend
+	island          islandBackend
 	sound           soundBackend
 	tray            trayBackend
 	corrupt         bool
@@ -348,6 +472,17 @@ func newPlugin(out io.Writer, dataDir string, now func() time.Time, newID func()
 		wakeCh:   make(chan struct{}, 1),
 		sound:    newSoundBackend(),
 	}
+	p.island = newIslandBackend(islandCallbacks{
+		Pause:    func(id string) { p.handleIslandAction(id, "pause") },
+		Resume:   func(id string) { p.handleIslandAction(id, "resume") },
+		Restart:  func(id string) { p.handleIslandAction(id, "restart") },
+		Cancel:   func(id string) { p.handleIslandAction(id, "cancel") },
+		Ack:      func(id string) { p.handleIslandAction(id, "acknowledge") },
+		Snooze:   func(id string) { p.handleIslandAction(id, "snooze") },
+		OpenList: p.openListFromTray,
+		AckAll:   p.acknowledgeAllFromWindow,
+		Failed:   p.islandFailed,
+	})
 	p.window = newWindowBackend(windowCallbacks{
 		Ack:       p.acknowledgeFromWindow,
 		AckAll:    p.acknowledgeAllFromWindow,
@@ -514,10 +649,77 @@ func (p *Plugin) traySnapshot() []trayTimerSnapshot {
 }
 
 func (p *Plugin) refreshTray() {
-	if p.tray == nil {
+	if p.tray != nil {
+		p.tray.Update(p.traySnapshot())
+	}
+	p.refreshIsland()
+}
+
+func (p *Plugin) islandModeLocked() bool {
+	return p.boolSettingLocked("island_mode", false)
+}
+
+func (p *Plugin) refreshIsland() {
+	if p.island == nil {
 		return
 	}
-	p.tray.Update(p.traySnapshot())
+	p.mu.Lock()
+	enabled := p.islandModeLocked()
+	items := p.traySnapshotLocked(p.now())
+	hasPending := false
+	for _, item := range items {
+		if normalizedTrayStatus(item.Status) == statusPending {
+			hasPending = true
+			break
+		}
+	}
+	broken := p.islandBroken
+	p.mu.Unlock()
+	if !enabled {
+		p.island.Hide()
+		return
+	}
+	if broken {
+		p.island.Hide()
+		return
+	}
+	p.island.Refresh(items, hasPending)
+}
+
+func (p *Plugin) applyIslandSettings() {
+	if p.island == nil {
+		return
+	}
+	p.mu.Lock()
+	enabled := p.islandModeLocked()
+	p.mu.Unlock()
+	p.island.SetEnabled(enabled)
+	if enabled {
+		p.window.Hide()
+	} else {
+		p.syncWindow(true)
+	}
+	p.refreshIsland()
+}
+
+func (p *Plugin) handleIslandAction(id, action string) {
+	p.beginInteraction()
+	defer p.endInteraction()
+	_ = p.doActionNamed(actionData{TimerID: id}, action)
+}
+
+func (p *Plugin) islandFailed() {
+	p.mu.Lock()
+	alreadyBroken := p.islandBroken
+	p.islandBroken = true
+	items := p.pendingItemsLocked()
+	p.mu.Unlock()
+	if p.island != nil {
+		p.island.Hide()
+	}
+	if !alreadyBroken && len(items) > 0 {
+		p.notifyItems(items)
+	}
 }
 
 func (p *Plugin) applyTraySettings() {
@@ -674,6 +876,12 @@ func (p *Plugin) windowFailed() {
 
 func (p *Plugin) syncWindow(force bool) {
 	p.mu.Lock()
+	if p.islandModeLocked() {
+		p.deferredWindow = false
+		p.mu.Unlock()
+		p.window.Hide()
+		return
+	}
 	items := p.pendingItemsLocked()
 	enabled := p.floatingEnabledLocked()
 	busy := p.interactionBusy > 0
@@ -709,6 +917,12 @@ func (p *Plugin) syncWindow(force bool) {
 
 func (p *Plugin) flushDeferredWindow() {
 	p.mu.Lock()
+	if p.islandModeLocked() {
+		p.deferredWindow = false
+		p.mu.Unlock()
+		p.window.Hide()
+		return
+	}
 	deferred := p.deferredWindow
 	enabled := p.floatingEnabledLocked()
 	items := p.pendingItemsLocked()
@@ -935,6 +1149,9 @@ func (p *Plugin) stop() {
 	}
 	if p.tray != nil {
 		p.tray.Close()
+	}
+	if p.island != nil {
+		p.island.Hide()
 	}
 }
 
@@ -1390,7 +1607,9 @@ func (p *Plugin) processDue(now time.Time) bool {
 		// acknowledge/snooze cannot race ahead and leave audio playing afterward.
 		p.playReminderSoundLocked()
 	}
-	floating := len(reminderTitles) > 0 && p.floatingEnabledLocked()
+	islandMode := p.islandModeLocked()
+	floating := len(reminderTitles) > 0 && (p.floatingEnabledLocked() || islandMode)
+	islandBroken := p.islandBroken
 	refreshList := len(reminderTitles) > 0 && p.listVisible
 	if refreshList {
 		p.refreshList()
@@ -1401,7 +1620,13 @@ func (p *Plugin) processDue(now time.Time) bool {
 		p.notifyToast("还有 1 分钟到期：" + title)
 	}
 	if len(reminderTitles) > 0 {
-		if floating {
+		if islandMode {
+			if islandBroken {
+				p.notifyPendingTitles(reminderTitles)
+			} else {
+				p.refreshIsland()
+			}
+		} else if floating {
 			p.syncWindow(true)
 		} else {
 			p.notifyPendingTitles(reminderTitles)
@@ -2128,6 +2353,7 @@ func (p *Plugin) handleLine(line []byte) bool {
 		p.mu.Unlock()
 		p.applyWindowSettings()
 		p.applyTraySettings()
+		p.applyIslandSettings()
 		p.reply(req.ID, map[string]any{"protocolVersion": "1", "name": appName}, nil)
 		p.warnInvalidSoundFile(initialSoundFile)
 		go p.start()
@@ -2187,6 +2413,7 @@ func (p *Plugin) handleLine(line []byte) bool {
 		}
 		p.applyWindowSettings()
 		p.applyTraySettings()
+		p.applyIslandSettings()
 		p.syncWindow(false)
 		p.wakeScheduler()
 		return false

@@ -90,6 +90,7 @@ func testPlugin(t *testing.T, now time.Time) (*Plugin, *bytes.Buffer, string) {
 	p.sound = &fakeSound{}
 	p.window = &fakeWindow{showOK: true}
 	p.tray = &fakeTrayBackend{iconOwned: true, nextIconHandle: 1}
+	p.island = &fakeIslandBackend{}
 	p.settings["floating_window"] = false
 	return p, out, dir
 }
@@ -1562,6 +1563,52 @@ func (f *fakeTrayBackend) snapshot() (enabled bool, adds, modifies, deletes, rea
 	return f.enabled, f.addCalls, f.modifyCalls, f.deleteCalls, f.taskbarReadds, f.closeCalls, append([]trayTimerSnapshot(nil), f.lastItems...)
 }
 
+type fakeIslandBackend struct {
+	mu        sync.Mutex
+	enabled   bool
+	visible   bool
+	items     []trayTimerSnapshot
+	pending   bool
+	refreshes int
+	hides     int
+	sets      []bool
+}
+
+func (f *fakeIslandBackend) SetEnabled(enabled bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enabled = enabled
+	f.sets = append(f.sets, enabled)
+	if !enabled {
+		f.visible = false
+	}
+}
+func (f *fakeIslandBackend) Refresh(items []trayTimerSnapshot, hasPending bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.items = append([]trayTimerSnapshot(nil), items...)
+	f.pending = hasPending
+	f.refreshes++
+	model := buildIslandViewModel(items, hasPending, f.enabled, false, fixedNow())
+	f.visible = model.Visible
+}
+func (f *fakeIslandBackend) Hide() {
+	f.mu.Lock()
+	f.visible = false
+	f.hides++
+	f.mu.Unlock()
+}
+func (f *fakeIslandBackend) Visible() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.visible
+}
+func (f *fakeIslandBackend) snapshot() (bool, bool, int, []trayTimerSnapshot) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.visible, f.pending, f.refreshes, append([]trayTimerSnapshot(nil), f.items...)
+}
+
 type fakeSound struct {
 	mu           sync.Mutex
 	files        []string
@@ -2416,5 +2463,255 @@ func TestRestartPendingStopsCurrentSound(t *testing.T) {
 	}
 	if p.timers[id].Status != statusRunning {
 		t.Fatalf("pending restart state=%q want running", p.timers[id].Status)
+	}
+}
+
+func TestIslandVisibilityRules(t *testing.T) {
+	now := fixedNow()
+	running := []trayTimerSnapshot{{ID: "r", Status: statusRunning, EndsAt: now.Add(5 * time.Minute)}}
+	paused := []trayTimerSnapshot{{ID: "p", Status: statusPaused, RemainingSeconds: 90}}
+	pending := []trayTimerSnapshot{{ID: "d", Status: statusPending}}
+	if got := buildIslandViewModel(running, false, true, false, now); !got.Visible {
+		t.Fatal("island should be visible with a running timer")
+	}
+	if got := buildIslandViewModel(paused, false, true, false, now); got.Visible {
+		t.Fatal("island should hide when only paused timers exist")
+	}
+	if got := buildIslandViewModel(nil, false, true, false, now); got.Visible {
+		t.Fatal("island should hide when no timers exist")
+	}
+	if got := buildIslandViewModel(pending, true, true, false, now); !got.Visible || got.CollapsedText != "已到期" || !got.HasPending {
+		t.Fatalf("pending-only model = %#v", got)
+	}
+	if got := buildIslandViewModel(running, false, false, false, now); got.Visible {
+		t.Fatal("island should remain hidden when island mode is disabled")
+	}
+}
+
+func TestIslandCollapsedContentUsesEarliestRunningAndFixedWidth(t *testing.T) {
+	now := fixedNow()
+	items := []trayTimerSnapshot{
+		{ID: "later", Status: statusRunning, EndsAt: now.Add(9 * time.Minute)},
+		{ID: "earlier", Status: statusRunning, EndsAt: now.Add(2*time.Minute + 10*time.Second)},
+	}
+	first := buildIslandViewModel(items, false, true, false, now)
+	second := buildIslandViewModel(items, false, true, false, now.Add(time.Second))
+	if first.CollapsedText != formatRemaining(items[1].EndsAt, now) {
+		t.Fatalf("collapsed text = %q, want earliest timer %q", first.CollapsedText, formatRemaining(items[1].EndsAt, now))
+	}
+	if first.Width != 200 || second.Width != first.Width {
+		t.Fatalf("collapsed width changed: first=%d second=%d", first.Width, second.Width)
+	}
+}
+
+func TestIslandHoverLeaveGrace(t *testing.T) {
+	now := fixedNow()
+	var state islandHoverState
+	state.Hover()
+	if !state.expanded {
+		t.Fatal("hover should expand")
+	}
+	state.Leave(now)
+	if state.Tick(now.Add(299*time.Millisecond), false) || !state.expanded {
+		t.Fatal("island collapsed before the 300ms leave grace elapsed")
+	}
+	if !state.Tick(now.Add(300*time.Millisecond), false) || state.expanded {
+		t.Fatal("island did not collapse at the 300ms deadline")
+	}
+	state.Hover()
+	state.Leave(now)
+	if state.Tick(now.Add(300*time.Millisecond), true) || !state.expanded {
+		t.Fatal("pointer inside expanded panel should prevent collapse")
+	}
+}
+
+func TestIslandRowActionMapping(t *testing.T) {
+	cases := []struct{ status, first, second string }{
+		{statusRunning, "pause", "cancel"},
+		{statusPaused, "resume", "cancel"},
+		{statusPending, "acknowledge", "snooze"},
+	}
+	for _, test := range cases {
+		first, second := islandRowActions(test.status)
+		if first != test.first || second != test.second {
+			t.Errorf("%s actions = %q/%q, want %q/%q", test.status, first, second, test.first, test.second)
+		}
+	}
+	if islandAckAllEnabled(false) || !islandAckAllEnabled(true) {
+		t.Fatal("ack-all enabled state must follow hasPending")
+	}
+}
+
+func TestIslandModeProcessDueRefreshesIslandWithoutFloatingWindow(t *testing.T) {
+	now := fixedNow()
+	p, _, _ := testPlugin(t, now)
+	p.settings["island_mode"] = true
+	p.applyIslandSettings()
+	p.settings["sound_enabled"] = true
+	window := p.window.(*fakeWindow)
+	island := p.island.(*fakeIslandBackend)
+	p.timers["expired"] = &timer{
+		ID: "expired", Title: "泡面", CreatedAt: now.Add(-time.Minute),
+		EndsAt: now.Add(-time.Second), Status: statusRunning, OriginalSeconds: 60,
+	}
+	if !p.processDue(now) {
+		t.Fatal("processDue should process the expired timer")
+	}
+	visible, pending, refreshes, _ := island.snapshot()
+	if !visible || !pending || refreshes == 0 {
+		t.Fatalf("island state visible=%v pending=%v refreshes=%d", visible, pending, refreshes)
+	}
+	window.mu.Lock()
+	shows := window.shows
+	window.mu.Unlock()
+	if shows != 0 {
+		t.Fatalf("floating window Show called %d times in island mode", shows)
+	}
+	_, defaults, _ := p.sound.(*fakeSound).snapshot()
+	if defaults != 1 {
+		t.Fatalf("expiry sound plays=%d, want 1", defaults)
+	}
+}
+
+func TestIslandModeSettingTogglesBackendAndHidesFloatingWindow(t *testing.T) {
+	p, _, _ := testPlugin(t, fixedNow())
+	island := p.island.(*fakeIslandBackend)
+	window := p.window.(*fakeWindow)
+	p.applyIslandSettings()
+	if p.islandModeLocked() {
+		t.Fatal("island_mode must default to false")
+	}
+	p.settings["island_mode"] = true
+	p.applyIslandSettings()
+	if !island.enabled {
+		t.Fatal("island backend was not enabled")
+	}
+	window.mu.Lock()
+	hides := window.hides
+	window.mu.Unlock()
+	if hides == 0 {
+		t.Fatal("enabling island mode should hide the old floating window")
+	}
+	p.settings["island_mode"] = false
+	p.applyIslandSettings()
+	if island.enabled {
+		t.Fatal("island backend was not disabled")
+	}
+}
+
+func TestIslandRefreshOnSchedulerWake(t *testing.T) {
+	now := fixedNow()
+	current := now
+	p, _, _ := testPlugin(t, now)
+	p.now = func() time.Time { return current }
+	p.settings["island_mode"] = true
+	p.island.SetEnabled(true)
+	p.timers["running"] = &timer{ID: "running", Title: "计时", Status: statusRunning, CreatedAt: now, EndsAt: now.Add(10 * time.Minute), OriginalSeconds: 600}
+	island := p.island.(*fakeIslandBackend)
+	_, _, before, _ := island.snapshot()
+	p.handleSchedulerWake(current)
+	_, _, after, items := island.snapshot()
+	if after <= before {
+		t.Fatal("scheduler wake did not refresh island")
+	}
+	if len(items) != 1 || items[0].RemainingSeconds != 600 {
+		t.Fatalf("scheduler snapshot = %#v", items)
+	}
+	current = current.Add(time.Minute)
+	p.handleSchedulerWake(current)
+	_, _, _, items = island.snapshot()
+	if len(items) != 1 || items[0].RemainingSeconds != 540 {
+		t.Fatalf("remaining time did not update after scheduler wake: %#v", items)
+	}
+}
+
+func TestDispatchIslandActionUsesExistingActionNames(t *testing.T) {
+	var got string
+	callbacks := islandCallbacks{
+		Pause:   func(string) { got = "pause" },
+		Resume:  func(string) { got = "resume" },
+		Restart: func(string) { got = "restart" },
+		Cancel:  func(string) { got = "cancel" },
+		Ack:     func(string) { got = "acknowledge" },
+		Snooze:  func(string) { got = "snooze" },
+	}
+	for _, action := range []string{"pause", "resume", "restart", "cancel", "acknowledge", "snooze"} {
+		got = ""
+		dispatchIslandAction(callbacks, "timer-id", action)
+		if got != action {
+			t.Errorf("dispatch %q called %q", action, got)
+		}
+	}
+	got = ""
+	dispatchIslandAction(callbacks, "timer-id", "unknown")
+	if got != "" {
+		t.Fatalf("unknown action unexpectedly dispatched %q", got)
+	}
+}
+
+func TestIslandModeSuppressesFloatingWindow(t *testing.T) {
+	p, _, _ := testPlugin(t, fixedNow())
+	p.settings["island_mode"] = true
+	p.timers["pending"] = &timer{ID: "pending", Title: "到期任务", Status: statusPending, EndedAt: fixedNow()}
+	p.syncWindow(true)
+	window := p.window.(*fakeWindow)
+	window.mu.Lock()
+	shows, hides := window.shows, window.hides
+	window.mu.Unlock()
+	if shows != 0 || hides == 0 {
+		t.Fatalf("island mode floating window shows=%d hides=%d; want no show and at least one hide", shows, hides)
+	}
+}
+
+func TestIslandFailureFallsBackToToast(t *testing.T) {
+	now := fixedNow()
+	p, out, _ := testPlugin(t, now)
+	p.settings["island_mode"] = true
+	p.islandBroken = true
+	p.timers["expired"] = &timer{ID: "expired", Title: "失败兜底", CreatedAt: now.Add(-time.Minute), EndsAt: now.Add(-time.Second), Status: statusRunning, OriginalSeconds: 60}
+	if !p.processDue(now) {
+		t.Fatal("processDue should process expired timer")
+	}
+	if got := notificationCount(out.String()); got != 1 {
+		t.Fatalf("island failure toast count=%d want=1; output=%s", got, out.String())
+	}
+}
+
+func TestDisabledFloatingAndIslandModesUseToast(t *testing.T) {
+	now := fixedNow()
+	p, out, _ := testPlugin(t, now)
+	p.settings["floating_window"] = false
+	p.settings["island_mode"] = false
+	p.timers["expired"] = &timer{ID: "expired", Title: "普通通知", CreatedAt: now.Add(-time.Minute), EndsAt: now.Add(-time.Second), Status: statusRunning, OriginalSeconds: 60}
+	if !p.processDue(now) {
+		t.Fatal("processDue should process expired timer")
+	}
+	if got := notificationCount(out.String()); got != 1 {
+		t.Fatalf("fallback toast count=%d want=1; output=%s", got, out.String())
+	}
+}
+
+func TestSettingsChangedEnablesAndDisablesIsland(t *testing.T) {
+	p, _, _ := testPlugin(t, fixedNow())
+	island := p.island.(*fakeIslandBackend)
+	p.handleLine([]byte(`{"jsonrpc":"2.0","method":"settingsChanged","params":{"settings":{"island_mode":true,"floating_window":true}}}`))
+	if !island.enabled {
+		t.Fatal("settingsChanged did not enable island backend")
+	}
+	p.handleLine([]byte(`{"jsonrpc":"2.0","method":"settingsChanged","params":{"settings":{"island_mode":false,"floating_window":false}}}`))
+	if island.enabled {
+		t.Fatal("settingsChanged did not disable island backend")
+	}
+	if len(island.sets) < 2 || !island.sets[len(island.sets)-2] || island.sets[len(island.sets)-1] {
+		t.Fatalf("island SetEnabled calls = %v", island.sets)
+	}
+}
+
+func TestIslandOpenListUsesExistingToastQueryBridge(t *testing.T) {
+	p, out, _ := testPlugin(t, fixedNow())
+	p.openListFromTray()
+	raw := out.String()
+	if !strings.Contains(raw, `"type":"setQuery"`) || !strings.Contains(raw, `"text":"倒计时 "`) {
+		t.Fatalf("open list bridge missing setQuery payload: %s", raw)
 	}
 }

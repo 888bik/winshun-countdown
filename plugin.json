@@ -1,4 +1,4 @@
-﻿{
+{
   "$schema": "https://raw.githubusercontent.com/LingCore/WinShun-plugins/main/schema/plugin.schema.json",
   "manifest": 1,
   "id": "me.countdown",
@@ -6,7 +6,7 @@
     "zh": "倒计时",
     "en": "Countdown"
   },
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": {
     "zh": "原生 Go 版倒计时，无需安装 Python。支持多个计时器，到期后需确认并持续提醒。",
     "en": "Native Go countdown timers. Multiple timers, acknowledgement pending state, and repeated reminders until confirmed."
@@ -28,6 +28,16 @@
     "ui"
   ],
   "settings": [
+    {
+      "key": "island_mode",
+      "type": "bool",
+      "title": {
+        "zh": "灵动岛模式",
+        "en": "Dynamic Island mode"
+      },
+      "hint": "开启后到期提醒改在屏幕顶部中央的灵动岛上显示，不再弹出原悬浮窗。开始通知和到期前 1 分钟提醒仍使用系统 toast。",
+      "default": false
+    },
     {
       "key": "floating_window",
       "type": "bool",
