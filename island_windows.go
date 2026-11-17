@@ -63,7 +63,7 @@ var (
 	islandProcKillTimer                  = islandUser32.NewProc("KillTimer")
 	islandProcDefWindowProc              = islandUser32.NewProc("DefWindowProcW")
 	islandProcGetModuleHandle            = syscall.NewLazyDLL("kernel32.dll").NewProc("GetModuleHandleW")
-	islandProcFillRect                   = islandGDI32.NewProc("FillRect")
+	islandProcFillRect                   = islandUser32.NewProc("FillRect")
 	islandProcCreateSolidBrush           = islandGDI32.NewProc("CreateSolidBrush")
 	islandProcDeleteObject               = islandGDI32.NewProc("DeleteObject")
 	islandProcSelectObject               = islandGDI32.NewProc("SelectObject")
