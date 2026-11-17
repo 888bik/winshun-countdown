@@ -5,6 +5,8 @@ package main
 import (
 	"math"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,7 +22,10 @@ const (
 	islandTMEHover      = 0x00000001
 	islandTMELeave      = 0x00000002
 	islandTimerLeave    = uintptr(1)
+	islandTimerPulse    = uintptr(2)
+	islandTimerAnim     = uintptr(3)
 	islandTimerTick     = uintptr(4)
+	islandTimerLeaveRow = uintptr(5)
 	islandExNoActivate  = 0x08000000
 	islandExLayered     = 0x00080000
 	islandWSPopup       = 0x80000000
@@ -32,6 +37,10 @@ const (
 	islandBaseHeight    = 36
 	islandRowHeight     = 52
 	islandMaxRows       = 6
+	islandCollapsedMin  = 160
+	islandCollapsedMax  = 300
+	islandCollapsedPad  = 12
+	islandCollapsedGap  = 8
 )
 
 type islandTrackMouseEvent struct {
@@ -81,6 +90,9 @@ var (
 	islandProcDispatchMessage            = islandUser32.NewProc("DispatchMessageW")
 	islandProcPostQuitMessage            = islandUser32.NewProc("PostQuitMessage")
 	islandProcGetDpiForWindow            = islandUser32.NewProc("GetDpiForWindow")
+	islandProcGetDC                      = islandUser32.NewProc("GetDC")
+	islandProcReleaseDC                  = islandUser32.NewProc("ReleaseDC")
+	islandProcGetTextExtentPoint32       = islandGDI32.NewProc("GetTextExtentPoint32W")
 	islandClassMu                        sync.Mutex
 	islandClassRegistered                bool
 	activeIsland                         *islandWinBackend
@@ -100,33 +112,43 @@ const (
 )
 
 type islandWinBackend struct {
-	callbacks     islandCallbacks
-	ready         chan bool
-	cmdMu         sync.Mutex
-	commands      []islandCommand
-	hwnd          uintptr
-	enabled       bool
-	visible       atomic.Bool
-	expanded      bool
-	hasPending    bool
-	items         []trayTimerSnapshot
-	scroll        int
-	dpi           int
-	width         int
-	height        int
-	font          uintptr
-	mouseTracking bool
-	anim          animation
-	animating     bool
-	alpha         int
-	corner        int
-	animFromW     int
-	animFromH     int
-	animFromC     int
-	animToW       int
-	animToH       int
-	animToC       int
-	failed        bool
+	callbacks        islandCallbacks
+	ready            chan bool
+	cmdMu            sync.Mutex
+	commands         []islandCommand
+	hwnd             uintptr
+	enabled          bool
+	visible          atomic.Bool
+	expanded         bool
+	hasPending       bool
+	items            []trayTimerSnapshot
+	scroll           int
+	dpi              int
+	width            int
+	height           int
+	font             uintptr
+	mouseTracking    bool
+	hoverRow         int
+	hoverHalf        int
+	leavingID        string
+	leavingAction    string
+	leaveStart       time.Time
+	leaveProgress    float64
+	collapsedTitle   string
+	collapsedText    string
+	collapsedExtra   int
+	collapsedPending bool
+	anim             animation
+	animating        bool
+	alpha            int
+	corner           int
+	animFromW        int
+	animFromH        int
+	animFromC        int
+	animToW          int
+	animToH          int
+	animToC          int
+	failed           bool
 }
 
 type islandMessage struct {
@@ -140,7 +162,7 @@ type islandMessage struct {
 }
 
 func newIslandBackend(callbacks islandCallbacks) islandBackend {
-	b := &islandWinBackend{callbacks: callbacks, ready: make(chan bool, 1), dpi: 96, width: islandBaseWidth, height: islandBaseHeight}
+	b := &islandWinBackend{callbacks: callbacks, ready: make(chan bool, 1), dpi: 96, width: islandBaseWidth, height: islandBaseHeight, hoverRow: -1, hoverHalf: -1}
 	go b.loop()
 	<-b.ready
 	return b
@@ -183,6 +205,9 @@ func (b *islandWinBackend) drain() {
 				b.updateVisibility()
 			}
 		case islandCmdRefresh:
+			// If a row is mid-leave, settle it before replacing the snapshot.
+			// This guarantees exactly-once even when a refresh removes it.
+			b.finishLeave()
 			b.items = command.items
 			b.hasPending = command.pending
 			b.updateVisibility()
@@ -217,6 +242,8 @@ func (b *islandWinBackend) loop() {
 		islandProcDeleteObject.Call(b.font)
 		b.font = 0
 	}
+	// Window teardown is the final safety net for a leave animation.
+	b.finishLeave()
 	if b.hwnd != 0 {
 		islandProcDestroyWindow.Call(b.hwnd)
 		b.hwnd = 0
@@ -270,12 +297,24 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 			return 0
 		case wmMouseMove:
 			activeIsland.trackMouse()
+			activeIsland.updateHover(int(int16(lParam)), int(int16(lParam>>16)))
 		case islandWMMouseHover:
-			activeIsland.expanded = true
-			activeIsland.startIslandAnimation(animEnter)
+			// TME_HOVER is one-shot; re-arm it after expanding so a later
+			// move-in still opens the panel.
+			activeIsland.mouseTracking = false
+			activeIsland.trackMouse()
+			// The re-arm above makes WM_MOUSEHOVER fire again after 1ms of
+			// stillness, so only expand once: restarting the enter animation
+			// on every hover event repainted the panel non-stop and the
+			// hover highlight visibly flickered.
+			if !activeIsland.expanded {
+				activeIsland.expanded = true
+				activeIsland.startIslandAnimation(animEnter)
+			}
 			return 0
 		case islandWMMouseLeave:
 			activeIsland.mouseTracking = false
+			activeIsland.clearHover()
 			islandProcSetTimer.Call(hwnd, islandTimerLeave, 300, 0)
 			return 0
 		case wmTimer:
@@ -283,15 +322,16 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 			case islandTimerLeave:
 				islandProcKillTimer.Call(hwnd, islandTimerLeave)
 				if !activeIsland.pointerInside() {
+					activeIsland.clearHover()
 					activeIsland.expanded = false
 					activeIsland.startIslandAnimation(animExit)
 				}
-			case 2:
+			case islandTimerPulse:
 				// Warm orange breathing pulse while at least one timer awaits acknowledgement.
 				phase := float64(time.Now().UnixNano()%int64(1400*time.Millisecond)) / float64(1400*time.Millisecond)
 				alpha := byte(245 + int(10*(0.5+0.5*math.Sin(phase*2*math.Pi))))
 				islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
-			case 3:
+			case islandTimerAnim:
 				progress, done := activeIsland.anim.progress(time.Now())
 				alpha := byte(237 + int(18*progress))
 				if activeIsland.anim.kind == animExit {
@@ -300,12 +340,14 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 				islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
 				activeIsland.applyAnimFrame(progress)
 				if done {
-					islandProcKillTimer.Call(hwnd, 3)
+					islandProcKillTimer.Call(hwnd, islandTimerAnim)
 					activeIsland.animating = false
 					activeIsland.alpha = 255
 					islandProcSetLayeredWindowAttributes.Call(hwnd, 0, 255, 0x2)
 					activeIsland.layout()
 				}
+			case islandTimerLeaveRow:
+				activeIsland.stepLeave()
 			case islandTimerTick:
 				islandProcInvalidateRect.Call(hwnd, 0, 1)
 			}
@@ -330,6 +372,8 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 		case wmLButtonUp:
 			activeIsland.handleClick(int(int16(lParam)), int(int16(lParam>>16)))
 			return 0
+		case wmDestroy:
+			activeIsland.finishLeave()
 		}
 	}
 	result, _, _ := islandProcDefWindowProc.Call(hwnd, uintptr(message), wParam, lParam)
@@ -418,22 +462,121 @@ func (b *islandWinBackend) updateVisibility() {
 }
 
 func (b *islandWinBackend) hideOnGUI() {
+	// A pending row's action must not be lost just because the panel is
+	// collapsing/hiding mid-animation. Settle it before hiding.
+	b.finishLeave()
+	b.clearHover()
 	b.visible.Store(false)
 	b.expanded = false
 	b.scroll = 0
 	if b.hwnd != 0 {
-		islandProcKillTimer.Call(b.hwnd, 2)
-		islandProcKillTimer.Call(b.hwnd, 3)
+		islandProcKillTimer.Call(b.hwnd, islandTimerPulse)
+		islandProcKillTimer.Call(b.hwnd, islandTimerAnim)
 		islandProcKillTimer.Call(b.hwnd, islandTimerTick)
+		islandProcKillTimer.Call(b.hwnd, islandTimerLeaveRow)
 		islandProcShowWindow.Call(b.hwnd, swHide)
 	}
 }
 
+type islandTextSize struct {
+	cx int32
+	cy int32
+}
+
+func (b *islandWinBackend) textExtent(hdc uintptr, text string) int {
+	if hdc == 0 || text == "" {
+		return 0
+	}
+	old := uintptr(0)
+	if b.font != 0 {
+		old, _, _ = islandProcSelectObject.Call(hdc, b.font)
+	}
+	wide, err := syscall.UTF16FromString(text)
+	if err != nil {
+		if old != 0 {
+			islandProcSelectObject.Call(hdc, old)
+		}
+		return 0
+	}
+	var size islandTextSize
+	islandProcGetTextExtentPoint32.Call(hdc, uintptr(unsafe.Pointer(&wide[0])), uintptr(len(wide)-1), uintptr(unsafe.Pointer(&size)))
+	if old != 0 {
+		islandProcSelectObject.Call(hdc, old)
+	}
+	return int(size.cx)
+}
+
+func (b *islandWinBackend) collapsedWidth() int {
+	model := buildIslandViewModel(b.items, b.hasPending, true, false, time.Now())
+	b.collapsedTitle = model.CollapsedTitle
+	b.collapsedExtra = model.CollapsedExtra
+	b.collapsedText = model.CollapsedText
+	b.collapsedPending = model.HasPending
+	if b.hwnd == 0 {
+		return b.scale(islandCollapsedWidth)
+	}
+	hdc, _, _ := islandProcGetDC.Call(b.hwnd)
+	if hdc == 0 {
+		return b.scale(islandCollapsedWidth)
+	}
+	defer islandProcReleaseDC.Call(b.hwnd, hdc)
+
+	title := model.CollapsedTitle
+	text := model.CollapsedText
+	extra := ""
+	if model.CollapsedExtra > 0 {
+		extra = "+" + strconv.Itoa(model.CollapsedExtra)
+	}
+	measure := func(candidate string) int {
+		width := 2 * b.scale(islandCollapsedPad)
+		if candidate != "" {
+			width += b.textExtent(hdc, candidate)
+		}
+		if text != "" {
+			if candidate != "" {
+				width += b.scale(islandCollapsedGap)
+			}
+			width += b.textExtent(hdc, text)
+		}
+		if extra != "" {
+			width += b.scale(islandCollapsedGap) + b.textExtent(hdc, extra)
+		}
+		return width
+	}
+	width := measure(title)
+	limit := b.scale(islandCollapsedMax)
+	for width > limit && title != "" {
+		runes := []rune(title)
+		if len(runes) > 1 {
+			title = string(runes[:len(runes)-1])
+			if title != "" && !strings.HasSuffix(title, "…") {
+				title += "…"
+			}
+		} else {
+			title = ""
+		}
+		width = measure(title)
+	}
+	b.collapsedTitle = title
+	minimum := b.scale(islandCollapsedMin)
+	if width < minimum {
+		width = minimum
+	}
+	if width > limit {
+		width = limit
+	}
+	return width
+}
+
 // islandTargetSize returns the window size and corner ellipse for the current
+
 // expanded state, in scaled pixels. The size animation interpolates between
 // two such targets.
 func (b *islandWinBackend) islandTargetSize() (width, height, corner int) {
-	width, height = islandBaseWidth, islandBaseHeight
+	if !b.expanded {
+		return b.collapsedWidth(), b.scale(islandBaseHeight), b.scale(36)
+	}
+	width, height = islandExpandedWidth, islandBaseHeight
 	corner = 36
 	if b.expanded {
 		width = islandExpandedWidth
@@ -442,6 +585,9 @@ func (b *islandWinBackend) islandTargetSize() (width, height, corner int) {
 			rows = islandMaxRows
 		}
 		height = 58 + rows*islandRowHeight + 42
+		if b.leavingVisibleIndex() >= 0 {
+			height -= int(float64(islandRowHeight) * b.leaveProgress)
+		}
 		corner = 56
 	}
 	return b.scale(width), b.scale(height), b.scale(corner)
@@ -481,15 +627,16 @@ func (b *islandWinBackend) layout() {
 	}
 	// A snap (refresh, DPI change, scroll) wins over any in-flight animation.
 	b.cancelIslandAnimation()
+	// Font first: collapsed width is measured with the real title font.
+	if b.font != 0 {
+		islandProcDeleteObject.Call(b.font)
+	}
+	b.font, _, _ = islandProcCreateFont.Call(uintptr(-b.scale(16)), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(mustUTF16("Segoe UI"))))
 	w, h, corner := b.islandTargetSize()
 	b.applyIslandSize(w, h, corner)
 	if b.failed {
 		return
 	}
-	if b.font != 0 {
-		islandProcDeleteObject.Call(b.font)
-	}
-	b.font, _, _ = islandProcCreateFont.Call(uintptr(-b.scale(16)), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(mustUTF16("Segoe UI"))))
 }
 
 func (b *islandWinBackend) visibleItems() []trayTimerSnapshot {
@@ -523,6 +670,90 @@ func (b *islandWinBackend) pointerInside() bool {
 	return cursor.x >= bounds.left && cursor.x < bounds.right && cursor.y >= bounds.top && cursor.y < bounds.bottom
 }
 
+func (b *islandWinBackend) clearHover() {
+	if b.hoverRow == -1 && b.hoverHalf == -1 {
+		return
+	}
+	b.hoverRow, b.hoverHalf = -1, -1
+	if b.hwnd != 0 {
+		islandProcInvalidateRect.Call(b.hwnd, 0, 0)
+	}
+}
+
+func (b *islandWinBackend) updateHover(x, y int) {
+	if !b.expanded || b.leavingID != "" {
+		b.clearHover()
+		return
+	}
+	row, half := islandHoverTarget(
+		x, y, b.scale(58), b.scale(islandRowHeight), len(b.visibleItems()),
+		b.scale(islandActionStartX), b.scale(islandActionSplitX),
+	)
+	if row == b.hoverRow && half == b.hoverHalf {
+		return
+	}
+	b.hoverRow, b.hoverHalf = row, half
+	if b.hwnd != 0 {
+		islandProcInvalidateRect.Call(b.hwnd, 0, 0)
+	}
+}
+
+func (b *islandWinBackend) startLeave(id, action string) {
+	if b.leavingID != "" || b.hwnd == 0 {
+		return
+	}
+	b.leavingID = id
+	b.leavingAction = action
+	b.leaveStart = time.Now()
+	b.leaveProgress = 0
+	b.clearHover()
+	islandProcSetTimer.Call(b.hwnd, islandTimerLeaveRow, 16, 0)
+}
+
+func (b *islandWinBackend) stepLeave() {
+	if b.leavingID == "" || b.hwnd == 0 {
+		islandProcKillTimer.Call(b.hwnd, islandTimerLeaveRow)
+		return
+	}
+	progress, done := islandLeaveFraction(b.leaveStart, time.Now())
+	b.leaveProgress = progress
+	islandProcInvalidateRect.Call(b.hwnd, 0, 0)
+	w, h, c := b.islandTargetSize()
+	b.applyIslandSize(w, h, c)
+	if done {
+		b.finishLeave()
+	}
+}
+
+func (b *islandWinBackend) finishLeave() {
+	if b.leavingID == "" {
+		return
+	}
+	id, action := b.leavingID, b.leavingAction
+	b.leavingID, b.leavingAction = "", ""
+	b.leaveProgress = 0
+	if b.hwnd != 0 {
+		islandProcKillTimer.Call(b.hwnd, islandTimerLeaveRow)
+	}
+	// Clear our state before invoking: the callback may synchronously
+	// Refresh/Hide, and must not be able to settle this action twice.
+	b.invoke(id, action)
+}
+
+func (b *islandWinBackend) leavingVisibleIndex() int {
+	if b.leavingID == "" {
+		return -1
+	}
+	items := b.visibleItems()
+	page := pageIndices(len(items), b.scroll, islandMaxRows)
+	for visibleIndex, itemIndex := range page {
+		if items[itemIndex].ID == b.leavingID {
+			return visibleIndex
+		}
+	}
+	return -1
+}
+
 func (b *islandWinBackend) handleClick(x, y int) {
 	if !b.expanded {
 		b.expanded = true
@@ -533,23 +764,41 @@ func (b *islandWinBackend) handleClick(x, y int) {
 	startY := b.scale(58)
 	items := b.visibleItems()
 	page := pageIndices(len(items), b.scroll, islandMaxRows)
+	leavingIndex := b.leavingVisibleIndex()
+	shift := int(float64(rowHeight) * b.leaveProgress)
 	for visibleIndex, itemIndex := range page {
+		if visibleIndex == leavingIndex {
+			return
+		}
 		top := startY + visibleIndex*rowHeight
+		if leavingIndex >= 0 && visibleIndex > leavingIndex {
+			top -= shift
+		}
 		if y < top || y >= top+rowHeight {
 			continue
 		}
 		item := items[itemIndex]
 		first, second := islandRowActions(item.Status)
-		actionStart := b.scale(165)
-		actionSplit := b.scale(250)
+		actionStart := b.scale(islandActionStartX)
+		actionSplit := b.scale(islandActionSplitX)
 		if x < actionStart {
 			return
 		}
-		if x < actionSplit {
-			b.invoke(item.ID, first)
-		} else {
-			b.invoke(item.ID, second)
+		action := first
+		if x >= actionSplit {
+			action = second
 		}
+		status := normalizedTrayStatus(item.Status)
+		if status == statusPending && (action == "acknowledge" || action == "snooze") {
+			// Another pending row may already be leaving. Settle that one
+			// first so a click on a different row is never swallowed.
+			if b.leavingID != "" && b.leavingID != item.ID {
+				b.finishLeave()
+			}
+			b.startLeave(item.ID, action)
+			return
+		}
+		b.invoke(item.ID, action)
 		return
 	}
 	if y >= b.height-b.scale(40) {
@@ -625,11 +874,33 @@ func (b *islandWinBackend) paint() {
 	orange := uintptr(0x00008CFF)
 	islandProcSetTextColor.Call(hdc, white)
 	if !b.expanded {
-		if b.hasPending {
+		model := buildIslandViewModel(b.items, b.hasPending, true, false, time.Now())
+		title := b.collapsedTitle
+		if title == "" {
+			title = model.CollapsedTitle
+		}
+		text := model.CollapsedText
+		extra := ""
+		if model.CollapsedExtra > 0 {
+			extra = "+" + strconv.Itoa(model.CollapsedExtra)
+		}
+		pad := int32(scaleInt(b.dpi, islandCollapsedPad))
+		gap := int32(scaleInt(b.dpi, islandCollapsedGap))
+		center := client.right / 2
+		if model.HasPending {
 			islandProcSetTextColor.Call(hdc, orange)
 		}
-		model := buildIslandViewModel(b.items, b.hasPending, true, false, time.Now())
-		drawIslandText(hdc, model.CollapsedText, rect{left: 0, top: 0, right: client.right, bottom: client.bottom}, dtCenter|dtVCenter|dtSingleLine)
+		drawIslandText(hdc, text, rect{left: 0, top: 0, right: client.right, bottom: client.bottom}, dtCenter|dtVCenter|dtSingleLine)
+		islandProcSetTextColor.Call(hdc, white)
+		drawIslandText(hdc, title, rect{left: pad, top: 0, right: center - gap, bottom: client.bottom}, dtLeft|dtVCenter|dtSingleLine|dtEndEllipsis)
+		if extra != "" {
+			if model.HasPending {
+				islandProcSetTextColor.Call(hdc, orange)
+			} else {
+				islandProcSetTextColor.Call(hdc, uintptr(0x00AAAAAA))
+			}
+			drawIslandText(hdc, extra, rect{left: center + gap, top: 0, right: client.right - pad, bottom: client.bottom}, dtRight|dtVCenter|dtSingleLine)
+		}
 	} else {
 		drawIslandText(hdc, "倒计时", rect{left: 0, top: int32(scaleInt(b.dpi, 8)), right: client.right, bottom: int32(scaleInt(b.dpi, 42))}, dtCenter|dtVCenter|dtSingleLine)
 		if divBrush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x002A2A2A)); divBrush != 0 {
@@ -638,17 +909,33 @@ func (b *islandWinBackend) paint() {
 			islandProcDeleteObject.Call(divBrush)
 		}
 		items := b.visibleItems()
+		leavingIndex := b.leavingVisibleIndex()
+		leaveShift := int(float64(scaleInt(b.dpi, islandRowHeight)) * b.leaveProgress)
 		for visibleIndex, itemIndex := range pageIndices(len(items), b.scroll, islandMaxRows) {
 			item := items[itemIndex]
 			top := scaleInt(b.dpi, 58) + visibleIndex*scaleInt(b.dpi, islandRowHeight)
+			if leavingIndex >= 0 && visibleIndex > leavingIndex {
+				top -= leaveShift
+			}
 			cardLeft := int32(scaleInt(b.dpi, 10))
 			cardRight := int32(b.width - scaleInt(b.dpi, 10))
 			cardTop := int32(top + scaleInt(b.dpi, 4))
 			cardBottom := int32(top + scaleInt(b.dpi, 48))
+			if visibleIndex == leavingIndex {
+				cardBottom = cardTop + int32(float64(scaleInt(b.dpi, 44))*(1-b.leaveProgress))
+			}
+			if cardBottom < cardTop {
+				cardBottom = cardTop
+			}
 			cardCorner := int32(scaleInt(b.dpi, 20))
+			cardFill := uintptr(0x00202020)
+			cardBorder := uintptr(0x00333333)
+			if visibleIndex == b.hoverRow && b.leavingID == "" {
+				cardFill, cardBorder = 0x002C2C2C, 0x004A4A4A
+			}
 			// Row card: slightly lighter fill + 1px border.
-			if cardBrush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x00202020)); cardBrush != 0 {
-				if cardPen, _, _ := islandProcCreatePen.Call(0, 1, uintptr(0x00333333)); cardPen != 0 {
+			if cardBrush, _, _ := islandProcCreateSolidBrush.Call(cardFill); cardBrush != 0 {
+				if cardPen, _, _ := islandProcCreatePen.Call(0, 1, cardBorder); cardPen != 0 {
 					oldPen, _, _ := islandProcSelectObject.Call(hdc, cardPen)
 					oldBrush, _, _ := islandProcSelectObject.Call(hdc, cardBrush)
 					islandProcRoundRect.Call(hdc, uintptr(cardLeft), uintptr(cardTop), uintptr(cardRight), uintptr(cardBottom), uintptr(cardCorner), uintptr(cardCorner))
@@ -684,8 +971,24 @@ func (b *islandWinBackend) paint() {
 			case statusPending:
 				left, right = "已知晓", "稍后提醒"
 			}
-			drawIslandText(hdc, left, rect{left: int32(b.scale(170)), top: cardTop, right: int32(b.scale(247)), bottom: cardBottom}, dtRight|dtVCenter|dtSingleLine)
-			drawIslandText(hdc, right, rect{left: int32(b.scale(255)), top: cardTop, right: cardRight - int32(scaleInt(b.dpi, 8)), bottom: cardBottom}, dtRight|dtVCenter|dtSingleLine)
+			firstRect := rect{left: int32(b.scale(islandActionStartX)), top: cardTop, right: int32(b.scale(islandActionSplitX)), bottom: cardBottom}
+			secondRect := rect{left: int32(b.scale(islandActionSplitX)), top: cardTop, right: cardRight - int32(scaleInt(b.dpi, 8)), bottom: cardBottom}
+			if visibleIndex == b.hoverRow && b.leavingID == "" {
+				pillRect := firstRect
+				if b.hoverHalf == 1 {
+					pillRect = secondRect
+				}
+				if b.hoverHalf == 0 || b.hoverHalf == 1 {
+					if pill, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x003A3A3A)); pill != 0 {
+						oldBrush, _, _ := islandProcSelectObject.Call(hdc, pill)
+						islandProcRoundRect.Call(hdc, uintptr(pillRect.left), uintptr(pillRect.top), uintptr(pillRect.right), uintptr(pillRect.bottom), uintptr(scaleInt(b.dpi, 12)), uintptr(scaleInt(b.dpi, 12)))
+						islandProcSelectObject.Call(hdc, oldBrush)
+						islandProcDeleteObject.Call(pill)
+					}
+				}
+			}
+			drawIslandText(hdc, left, firstRect, dtRight|dtVCenter|dtSingleLine)
+			drawIslandText(hdc, right, secondRect, dtRight|dtVCenter|dtSingleLine)
 		}
 		if divBrush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x002A2A2A)); divBrush != 0 {
 			divRect := rect{left: int32(scaleInt(b.dpi, 12)), top: client.bottom - int32(scaleInt(b.dpi, 42)), right: client.right - int32(scaleInt(b.dpi, 12)), bottom: client.bottom - int32(scaleInt(b.dpi, 42)) + 1}

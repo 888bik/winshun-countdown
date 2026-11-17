@@ -95,12 +95,14 @@ type islandBackend interface {
 }
 
 type islandViewModel struct {
-	Visible       bool
-	Expanded      bool
-	HasPending    bool
-	CollapsedText string
-	Width         int
-	Items         []trayTimerSnapshot
+	Visible        bool
+	Expanded       bool
+	HasPending     bool
+	CollapsedText  string
+	CollapsedTitle string
+	CollapsedExtra int
+	Width          int
+	Items          []trayTimerSnapshot
 }
 
 func islandRowActions(status string) (string, string) {
@@ -165,13 +167,37 @@ func buildIslandViewModel(items []trayTimerSnapshot, hasPending, enabled, expand
 			earliest = item
 		}
 	}
-	if earliest != nil {
+	pendingCount := 0
+	for i := range items {
+		if normalizedTrayStatus(items[i].Status) == statusPending {
+			pendingCount++
+		}
+	}
+	if earliest == nil {
+		// No running timer: the earliest pending item becomes the main one;
+		// paused timers only contribute to the count.
+		for i := range items {
+			item := &items[i]
+			if normalizedTrayStatus(item.Status) != statusPending {
+				continue
+			}
+			if earliest == nil || item.EndedAt.Before(earliest.EndedAt) {
+				earliest = item
+			}
+		}
+		if earliest != nil {
+			model.Visible = true
+			model.CollapsedText = "已到期"
+		}
+	} else {
 		model.Visible = true
 		model.CollapsedText = formatRemaining(earliest.EndsAt, now)
-	} else if hasPending {
-		model.Visible = true
-		model.CollapsedText = "已到期"
 	}
+	if model.Visible && earliest != nil {
+		model.CollapsedTitle = truncateTrayTitle(earliest.Title, 6)
+		model.CollapsedExtra = len(items) - 1
+	}
+	model.HasPending = hasPending || pendingCount > 0
 	return model
 }
 

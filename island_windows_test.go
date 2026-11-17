@@ -53,8 +53,11 @@ func TestIslandProcsResolve(t *testing.T) {
 		{"DispatchMessageW", islandProcDispatchMessage},
 		{"PostQuitMessage", islandProcPostQuitMessage},
 		{"GetDpiForWindow", islandProcGetDpiForWindow},
+		{"GetDC", islandProcGetDC},
+		{"ReleaseDC", islandProcReleaseDC},
+		{"GetTextExtentPoint32W", islandProcGetTextExtentPoint32},
 	}
-	if len(procs) != 37 {
+	if len(procs) != 40 {
 		t.Fatalf("island proc list has %d entries, want 37; update the list when procs are added", len(procs))
 	}
 	for _, p := range procs {

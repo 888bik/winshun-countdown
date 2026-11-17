@@ -2491,16 +2491,60 @@ func TestIslandVisibilityRules(t *testing.T) {
 func TestIslandCollapsedContentUsesEarliestRunningAndFixedWidth(t *testing.T) {
 	now := fixedNow()
 	items := []trayTimerSnapshot{
-		{ID: "later", Status: statusRunning, EndsAt: now.Add(9 * time.Minute)},
-		{ID: "earlier", Status: statusRunning, EndsAt: now.Add(2*time.Minute + 10*time.Second)},
+		{ID: "later", Title: "稍后", Status: statusRunning, EndsAt: now.Add(9 * time.Minute)},
+		{ID: "earlier", Title: "吃饭", Status: statusRunning, EndsAt: now.Add(2*time.Minute + 10*time.Second)},
 	}
 	first := buildIslandViewModel(items, false, true, false, now)
 	second := buildIslandViewModel(items, false, true, false, now.Add(time.Second))
 	if first.CollapsedText != formatRemaining(items[1].EndsAt, now) {
 		t.Fatalf("collapsed text = %q, want earliest timer %q", first.CollapsedText, formatRemaining(items[1].EndsAt, now))
 	}
+	if first.CollapsedTitle != "吃饭" || first.CollapsedExtra != 1 {
+		t.Fatalf("collapsed title/extra = %q/%d", first.CollapsedTitle, first.CollapsedExtra)
+	}
 	if first.Width != 200 || second.Width != first.Width {
 		t.Fatalf("collapsed width changed: first=%d second=%d", first.Width, second.Width)
+	}
+}
+
+func TestIslandCollapsedTitleAndExtra(t *testing.T) {
+	now := fixedNow()
+	items := []trayTimerSnapshot{
+		{ID: "run", Title: "番茄专注", Status: statusRunning, EndsAt: now.Add(25 * time.Minute)},
+		{ID: "pause", Title: "休息", Status: statusPaused, RemainingSeconds: 300},
+		{ID: "pending", Title: "吃饭", Status: statusPending, EndedAt: now.Add(-time.Minute)},
+	}
+	model := buildIslandViewModel(items, true, true, false, now)
+	if model.CollapsedTitle != "番茄专注" || model.CollapsedExtra != 2 || model.CollapsedText != formatRemaining(items[0].EndsAt, now) {
+		t.Fatalf("running model = %#v", model)
+	}
+
+	pending := []trayTimerSnapshot{
+		{ID: "late", Title: "午休", Status: statusPending, EndedAt: now.Add(-time.Minute)},
+		{ID: "early", Title: "吃饭", Status: statusPending, EndedAt: now.Add(-2 * time.Minute)},
+	}
+	model = buildIslandViewModel(pending, true, true, false, now)
+	if model.CollapsedTitle != "吃饭" || model.CollapsedExtra != 1 || model.CollapsedText != "已到期" {
+		t.Fatalf("pending model = %#v", model)
+	}
+	if !model.Visible {
+		t.Fatal("pending-only island should be visible")
+	}
+}
+
+func TestIslandCollapsedTitleTruncatesAtSixRunes(t *testing.T) {
+	now := fixedNow()
+	model := buildIslandViewModel([]trayTimerSnapshot{
+		{ID: "long", Title: "这是一个非常非常长的标题", Status: statusRunning, EndsAt: now.Add(time.Minute)},
+	}, false, true, false, now)
+	if got := []rune(model.CollapsedTitle); len(got) != 7 || !strings.HasSuffix(model.CollapsedTitle, "…") {
+		t.Fatalf("truncated title = %q", model.CollapsedTitle)
+	}
+}
+
+func TestIslandCollapsedNoTimersIsHidden(t *testing.T) {
+	if got := buildIslandViewModel(nil, false, true, false, fixedNow()); got.Visible || got.CollapsedTitle != "" || got.CollapsedExtra != 0 {
+		t.Fatalf("empty model = %#v", got)
 	}
 }
 
