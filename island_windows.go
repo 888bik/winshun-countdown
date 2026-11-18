@@ -95,8 +95,31 @@ var (
 	islandProcGetTextExtentPoint32       = islandGDI32.NewProc("GetTextExtentPoint32W")
 	islandClassMu                        sync.Mutex
 	islandClassRegistered                bool
-	activeIsland                         *islandWinBackend
+	// islandBackends maps window handles to their backend. The window
+	// procedure runs on the GUI thread while the backend is created and
+	// torn down from the plugin, so the lookup is guarded by a mutex:
+	// the old package-level pointer was read and written without one.
+	islandBackendsMu sync.Mutex
+	islandBackends   = map[uintptr]*islandWinBackend{}
 )
+
+func registerIslandBackend(hwnd uintptr, b *islandWinBackend) {
+	islandBackendsMu.Lock()
+	islandBackends[hwnd] = b
+	islandBackendsMu.Unlock()
+}
+
+func lookupIslandBackend(hwnd uintptr) *islandWinBackend {
+	islandBackendsMu.Lock()
+	defer islandBackendsMu.Unlock()
+	return islandBackends[hwnd]
+}
+
+func unregisterIslandBackend(hwnd uintptr) {
+	islandBackendsMu.Lock()
+	delete(islandBackends, hwnd)
+	islandBackendsMu.Unlock()
+}
 
 type islandCommand struct {
 	kind    int
@@ -149,6 +172,26 @@ type islandWinBackend struct {
 	animToH          int
 	animToC          int
 	failed           bool
+	// Derived caches, invalidated only when their inputs change.
+	// visibleCache holds the sorted running+paused+pending snapshot;
+	// leavingCache is the visible index of the row mid-leave (-1: none);
+	// modelCache is the view model (its remaining-time text only changes
+	// once a second, so the 1s tick invalidates it).
+	visibleCache      []trayTimerSnapshot
+	visibleCacheValid bool
+	leavingCache      int
+	leavingCacheValid bool
+	modelCache        islandViewModel
+	modelCacheValid   bool
+	// GDI objects for the fixed island colours, created once by ensureGDI
+	// and deleted by destroyGDI when the message loop exits. paint only
+	// selects them in and out, never deletes them.
+	brushBg, brushDiv, brushCard, brushPill    uintptr
+	penOutline, penCard, penCardHover, penPill uintptr
+	// Last alpha applied by the breathing pulse (-1: none yet). The pulse
+	// skips the system call while the value is unchanged and no size
+	// animation is running.
+	lastPulseAlpha int
 }
 
 type islandMessage struct {
@@ -162,7 +205,7 @@ type islandMessage struct {
 }
 
 func newIslandBackend(callbacks islandCallbacks) islandBackend {
-	b := &islandWinBackend{callbacks: callbacks, ready: make(chan bool, 1), dpi: 96, width: islandBaseWidth, height: islandBaseHeight, hoverRow: -1, hoverHalf: -1}
+	b := &islandWinBackend{callbacks: callbacks, ready: make(chan bool, 1), dpi: 96, width: islandBaseWidth, height: islandBaseHeight, hoverRow: -1, hoverHalf: -1, lastPulseAlpha: -1}
 	go b.loop()
 	<-b.ready
 	return b
@@ -210,6 +253,8 @@ func (b *islandWinBackend) drain() {
 			b.finishLeave()
 			b.items = command.items
 			b.hasPending = command.pending
+			b.invalidateVisible()
+			b.invalidateModel()
 			b.updateVisibility()
 		case islandCmdHide:
 			b.hideOnGUI()
@@ -220,7 +265,6 @@ func (b *islandWinBackend) drain() {
 func (b *islandWinBackend) loop() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	activeIsland = b
 	if !b.ensureWindow() {
 		b.ready <- false
 		if b.callbacks.Failed != nil {
@@ -242,13 +286,17 @@ func (b *islandWinBackend) loop() {
 		islandProcDeleteObject.Call(b.font)
 		b.font = 0
 	}
+	b.destroyGDI()
 	// Window teardown is the final safety net for a leave animation.
 	b.finishLeave()
 	if b.hwnd != 0 {
-		islandProcDestroyWindow.Call(b.hwnd)
+		hwnd := b.hwnd
+		islandProcDestroyWindow.Call(hwnd)
+		// Unregister after the destroy: WM_DESTROY still needs the
+		// backend (finishLeave runs there).
+		unregisterIslandBackend(hwnd)
 		b.hwnd = 0
 	}
-	activeIsland = nil
 }
 
 func (b *islandWinBackend) ensureWindow() bool {
@@ -276,104 +324,144 @@ func (b *islandWinBackend) ensureWindow() bool {
 		return false
 	}
 	b.hwnd = hwnd
-	activeIsland = b
 	b.dpi = b.getDPI()
 	// A rounded native region keeps the transparent corners click-through. The
 	// layered alpha is uniform; all drawing remains on the GUI thread.
 	if result, _, _ := islandProcSetLayeredWindowAttributes.Call(hwnd, 0, 255, 0x2); result == 0 {
 		return false
 	}
+	// Register only once the window is fully built; messages that arrive
+	// during creation (WM_NCCREATE, WM_CREATE, ...) get default handling
+	// from DefWindowProc until then.
+	registerIslandBackend(hwnd, b)
 	return true
 }
 
 func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
-	if activeIsland != nil && activeIsland.hwnd == hwnd {
+	// Messages that arrive during window creation, before the backend is
+	// registered, fall through to DefWindowProc.
+	b := lookupIslandBackend(hwnd)
+	if b == nil {
+		result, _, _ := islandProcDefWindowProc.Call(hwnd, uintptr(message), wParam, lParam)
+		return result
+	}
+	{
 		switch message {
 		case wmPaint:
-			activeIsland.paint()
+			b.paint()
 			return 0
 		case islandWMCommand:
-			activeIsland.drain()
+			b.drain()
 			return 0
 		case wmMouseMove:
-			activeIsland.trackMouse()
-			activeIsland.updateHover(int(int16(lParam)), int(int16(lParam>>16)))
+			b.trackMouse()
+			b.updateHover(int(int16(lParam)), int(int16(lParam>>16)))
 		case islandWMMouseHover:
 			// TME_HOVER is one-shot; re-arm it after expanding so a later
 			// move-in still opens the panel.
-			activeIsland.mouseTracking = false
-			activeIsland.trackMouse()
+			b.mouseTracking = false
+			b.trackMouse()
 			// The re-arm above makes WM_MOUSEHOVER fire again after 1ms of
 			// stillness, so only expand once: restarting the enter animation
 			// on every hover event repainted the panel non-stop and the
 			// hover highlight visibly flickered.
-			if !activeIsland.expanded {
-				activeIsland.expanded = true
-				activeIsland.startIslandAnimation(animEnter)
+			if !b.expanded {
+				b.expanded = true
+				b.invalidateModel()
+				b.startIslandAnimation(animEnter)
 			}
 			return 0
 		case islandWMMouseLeave:
-			activeIsland.mouseTracking = false
-			activeIsland.clearHover()
+			b.mouseTracking = false
+			b.clearHover()
 			islandProcSetTimer.Call(hwnd, islandTimerLeave, 300, 0)
 			return 0
 		case wmTimer:
 			switch wParam {
 			case islandTimerLeave:
 				islandProcKillTimer.Call(hwnd, islandTimerLeave)
-				if !activeIsland.pointerInside() {
-					activeIsland.clearHover()
-					activeIsland.expanded = false
-					activeIsland.startIslandAnimation(animExit)
+				if !b.pointerInside() {
+					b.clearHover()
+					b.expanded = false
+					b.invalidateModel()
+					b.startIslandAnimation(animExit)
 				}
 			case islandTimerPulse:
 				// Warm orange breathing pulse while at least one timer awaits acknowledgement.
 				phase := float64(time.Now().UnixNano()%int64(1400*time.Millisecond)) / float64(1400*time.Millisecond)
 				alpha := byte(245 + int(10*(0.5+0.5*math.Sin(phase*2*math.Pi))))
-				islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
+				// The byte value repeats across ticks; skip the system call
+				// while it is unchanged and no size animation is
+				// rewriting alpha in the meantime.
+				if b.animating || int(alpha) != b.lastPulseAlpha {
+					b.lastPulseAlpha = int(alpha)
+					islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
+				}
 			case islandTimerAnim:
-				progress, done := activeIsland.anim.progress(time.Now())
+				progress, done := b.anim.progress(time.Now())
 				alpha := byte(237 + int(18*progress))
-				if activeIsland.anim.kind == animExit {
+				if b.anim.kind == animExit {
 					alpha = byte(255 - int(18*progress))
 				}
 				islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
-				activeIsland.applyAnimFrame(progress)
+				b.applyAnimFrame(progress)
 				if done {
 					islandProcKillTimer.Call(hwnd, islandTimerAnim)
-					activeIsland.animating = false
-					activeIsland.alpha = 255
+					b.animating = false
+					b.alpha = 255
+					b.lastPulseAlpha = 255
 					islandProcSetLayeredWindowAttributes.Call(hwnd, 0, 255, 0x2)
-					activeIsland.layout()
+					b.layout()
 				}
 			case islandTimerLeaveRow:
-				activeIsland.stepLeave()
+				b.stepLeave()
 			case islandTimerTick:
-				islandProcInvalidateRect.Call(hwnd, 0, 1)
+				// The remaining-time text is the only per-second change.
+				b.invalidateModel()
+				scoped := false
+				if b.expanded {
+					// Invalidate just the rows band; the title and bottom
+					// bar are static. The collapsed pill takes the full
+					// window.
+					rows := len(b.visibleItems())
+					if rows > islandMaxRows {
+						rows = islandMaxRows
+					}
+					if rows > 0 {
+						r := rect{left: 0, top: int32(b.scale(58)), right: int32(b.width), bottom: int32(b.scale(58) + rows*b.scale(islandRowHeight))}
+						islandProcInvalidateRect.Call(hwnd, uintptr(unsafe.Pointer(&r)), 1)
+						scoped = true
+					}
+				}
+				if !scoped {
+					islandProcInvalidateRect.Call(hwnd, 0, 1)
+				}
 			}
 			return 0
 		case wmDpiChanged:
-			activeIsland.dpi = activeIsland.getDPI()
-			activeIsland.layout()
+			b.dpi = b.getDPI()
+			b.layout()
 			return 0
 		case wmMouseWheel:
 			delta := int16(uint16(wParam >> 16))
-			maxScroll := len(activeIsland.visibleItems()) - islandMaxRows
+			maxScroll := len(b.visibleItems()) - islandMaxRows
 			if maxScroll < 0 {
 				maxScroll = 0
 			}
-			if delta < 0 && activeIsland.scroll < maxScroll {
-				activeIsland.scroll++
-			} else if delta > 0 && activeIsland.scroll > 0 {
-				activeIsland.scroll--
+			if delta < 0 && b.scroll < maxScroll {
+				b.scroll++
+				b.invalidateLeaving()
+			} else if delta > 0 && b.scroll > 0 {
+				b.scroll--
+				b.invalidateLeaving()
 			}
-			activeIsland.layout()
+			b.layout()
 			return 0
 		case wmLButtonUp:
-			activeIsland.handleClick(int(int16(lParam)), int(int16(lParam>>16)))
+			b.handleClick(int(int16(lParam)), int(int16(lParam>>16)))
 			return 0
 		case wmDestroy:
-			activeIsland.finishLeave()
+			b.finishLeave()
 		}
 	}
 	result, _, _ := islandProcDefWindowProc.Call(hwnd, uintptr(message), wParam, lParam)
@@ -441,7 +529,7 @@ func (b *islandWinBackend) updateVisibility() {
 		b.hideOnGUI()
 		return
 	}
-	model := buildIslandViewModel(b.items, b.hasPending, true, b.expanded, time.Now())
+	model := b.islandModel()
 	if !model.Visible {
 		b.hideOnGUI()
 		return
@@ -452,6 +540,7 @@ func (b *islandWinBackend) updateVisibility() {
 	} else {
 		islandProcKillTimer.Call(b.hwnd, 2)
 		b.alpha = 255
+		b.lastPulseAlpha = 255
 		islandProcSetLayeredWindowAttributes.Call(b.hwnd, 0, 255, 0x2)
 	}
 	b.layout()
@@ -469,6 +558,8 @@ func (b *islandWinBackend) hideOnGUI() {
 	b.visible.Store(false)
 	b.expanded = false
 	b.scroll = 0
+	b.invalidateLeaving()
+	b.invalidateModel()
 	if b.hwnd != 0 {
 		islandProcKillTimer.Call(b.hwnd, islandTimerLeave)
 		islandProcKillTimer.Call(b.hwnd, islandTimerPulse)
@@ -508,7 +599,7 @@ func (b *islandWinBackend) textExtent(hdc uintptr, text string) int {
 }
 
 func (b *islandWinBackend) collapsedWidth() int {
-	model := buildIslandViewModel(b.items, b.hasPending, true, false, time.Now())
+	model := b.islandModel()
 	b.collapsedTitle = model.CollapsedTitle
 	b.collapsedExtra = model.CollapsedExtra
 	b.collapsedText = model.CollapsedText
@@ -528,6 +619,13 @@ func (b *islandWinBackend) collapsedWidth() int {
 	if model.CollapsedExtra > 0 {
 		extra = "+" + strconv.Itoa(model.CollapsedExtra)
 	}
+	// text and extra never change while the title is being truncated;
+	// measure them once instead of on every loop pass.
+	textWidth := b.textExtent(hdc, text)
+	extraWidth := 0
+	if extra != "" {
+		extraWidth = b.textExtent(hdc, extra)
+	}
 	measure := func(candidate string) int {
 		width := 2 * b.scale(islandCollapsedPad)
 		if candidate != "" {
@@ -537,10 +635,10 @@ func (b *islandWinBackend) collapsedWidth() int {
 			if candidate != "" {
 				width += b.scale(islandCollapsedGap)
 			}
-			width += b.textExtent(hdc, text)
+			width += textWidth
 		}
 		if extra != "" {
-			width += b.scale(islandCollapsedGap) + b.textExtent(hdc, extra)
+			width += b.scale(islandCollapsedGap) + extraWidth
 		}
 		return width
 	}
@@ -595,7 +693,7 @@ func (b *islandWinBackend) islandTargetSize() (width, height, corner int) {
 }
 
 func (b *islandWinBackend) islandModelVisible() bool {
-	return buildIslandViewModel(b.items, b.hasPending, true, b.expanded, time.Now()).Visible
+	return b.islandModel().Visible
 }
 
 func (b *islandWinBackend) applyIslandSize(width, height, corner int) {
@@ -650,13 +748,91 @@ func (b *islandWinBackend) layout() {
 	}
 }
 
+// invalidateVisible drops the sorted visible-items cache (and, with it, the
+// leaving-row index). Call it whenever b.items changes.
+func (b *islandWinBackend) invalidateVisible() {
+	b.visibleCacheValid = false
+	b.leavingCacheValid = false
+}
+
+// invalidateLeaving drops the leaving-row index cache. Call it whenever
+// b.scroll or b.leavingID changes.
+func (b *islandWinBackend) invalidateLeaving() {
+	b.leavingCacheValid = false
+}
+
+// invalidateModel drops the view-model cache. Call it whenever b.items,
+// b.hasPending or b.expanded changes, or a second has passed.
+func (b *islandWinBackend) invalidateModel() {
+	b.modelCacheValid = false
+}
+
 func (b *islandWinBackend) visibleItems() []trayTimerSnapshot {
+	if b.visibleCacheValid {
+		return b.visibleCache
+	}
 	running, paused, pending := sortedTraySnapshots(b.items)
 	out := make([]trayTimerSnapshot, 0, len(b.items))
 	out = append(out, running...)
 	out = append(out, paused...)
 	out = append(out, pending...)
+	b.visibleCache = out
+	b.visibleCacheValid = true
 	return out
+}
+
+// islandModel returns the view model for the current snapshot, computed
+// once per change cycle. The remaining-time text only changes once a
+// second, so the 1s tick invalidates the cache.
+func (b *islandWinBackend) islandModel() islandViewModel {
+	if b.modelCacheValid {
+		return b.modelCache
+	}
+	b.modelCache = buildIslandViewModel(b.items, b.hasPending, true, b.expanded, time.Now())
+	b.modelCacheValid = true
+	return b.modelCache
+}
+
+// ensureGDI creates the fixed-colour brushes and pens once. They live
+// until destroyGDI runs when the message loop exits; paint only selects
+// them in and out and never deletes them.
+func (b *islandWinBackend) ensureGDI() {
+	if b.brushBg == 0 {
+		b.brushBg, _, _ = islandProcCreateSolidBrush.Call(uintptr(0x00141414))
+	}
+	if b.brushDiv == 0 {
+		b.brushDiv, _, _ = islandProcCreateSolidBrush.Call(uintptr(0x002A2A2A))
+	}
+	if b.brushCard == 0 {
+		b.brushCard, _, _ = islandProcCreateSolidBrush.Call(uintptr(0x00202020))
+	}
+	if b.brushPill == 0 {
+		b.brushPill, _, _ = islandProcCreateSolidBrush.Call(uintptr(0x003A3A3A))
+	}
+	if b.penOutline == 0 {
+		b.penOutline, _, _ = islandProcCreatePen.Call(0, 1, uintptr(0x00353535))
+	}
+	if b.penCard == 0 {
+		b.penCard, _, _ = islandProcCreatePen.Call(0, 1, uintptr(0x00333333))
+	}
+	if b.penCardHover == 0 {
+		b.penCardHover, _, _ = islandProcCreatePen.Call(0, 1, uintptr(0x004A4A4A))
+	}
+	if b.penPill == 0 {
+		b.penPill, _, _ = islandProcCreatePen.Call(0, 1, uintptr(0x005A5A5A))
+	}
+}
+
+// destroyGDI deletes the cached GDI objects. Only call it after the
+// message loop ends, when no paint can have one selected.
+func (b *islandWinBackend) destroyGDI() {
+	for _, obj := range []uintptr{b.brushBg, b.brushDiv, b.brushCard, b.brushPill, b.penOutline, b.penCard, b.penCardHover, b.penPill} {
+		if obj != 0 {
+			islandProcDeleteObject.Call(obj)
+		}
+	}
+	b.brushBg, b.brushDiv, b.brushCard, b.brushPill = 0, 0, 0, 0
+	b.penOutline, b.penCard, b.penCardHover, b.penPill = 0, 0, 0, 0
 }
 
 func (b *islandWinBackend) trackMouse() {
@@ -717,6 +893,7 @@ func (b *islandWinBackend) startLeave(id, action string) {
 	b.leavingAction = action
 	b.leaveStart = time.Now()
 	b.leaveProgress = 0
+	b.invalidateLeaving()
 	b.clearHover()
 	islandProcSetTimer.Call(b.hwnd, islandTimerLeaveRow, 16, 0)
 }
@@ -747,6 +924,7 @@ func (b *islandWinBackend) finishLeave() {
 	id, action := b.leavingID, b.leavingAction
 	b.leavingID, b.leavingAction = "", ""
 	b.leaveProgress = 0
+	b.invalidateLeaving()
 	if b.hwnd != 0 {
 		islandProcKillTimer.Call(b.hwnd, islandTimerLeaveRow)
 	}
@@ -770,12 +948,23 @@ func (b *islandWinBackend) finishLeave() {
 				break
 			}
 		}
+		b.invalidateVisible()
+		b.invalidateModel()
 	}
 	b.invoke(id, action)
 	b.updateVisibility()
 }
 
 func (b *islandWinBackend) leavingVisibleIndex() int {
+	if b.leavingCacheValid {
+		return b.leavingCache
+	}
+	b.leavingCache = b.computeLeavingVisibleIndex()
+	b.leavingCacheValid = true
+	return b.leavingCache
+}
+
+func (b *islandWinBackend) computeLeavingVisibleIndex() int {
 	if b.leavingID == "" {
 		return -1
 	}
@@ -792,6 +981,7 @@ func (b *islandWinBackend) leavingVisibleIndex() int {
 func (b *islandWinBackend) handleClick(x, y int) {
 	if !b.expanded {
 		b.expanded = true
+		b.invalidateModel()
 		b.startIslandAnimation(animEnter)
 		return
 	}
@@ -874,21 +1064,21 @@ func (b *islandWinBackend) paint() {
 	defer islandProcEndPaint.Call(b.hwnd, uintptr(unsafe.Pointer(&ps)))
 	var client rect
 	islandProcGetClientRect.Call(b.hwnd, uintptr(unsafe.Pointer(&client)))
+	b.ensureGDI()
+	now := time.Now()
 	// The pill stays near-black in every state; an expired timer is signalled
 	// by orange text plus the alpha pulse, not a full orange fill.
-	brush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x00141414))
-	if brush != 0 {
-		islandProcFillRect.Call(hdc, uintptr(unsafe.Pointer(&client)), brush)
-		islandProcDeleteObject.Call(brush)
+	if b.brushBg != 0 {
+		islandProcFillRect.Call(hdc, uintptr(unsafe.Pointer(&client)), b.brushBg)
 	}
 	// Subtle 1px outline so the pill reads against dark wallpapers.
 	corner := b.scale(36)
 	if b.expanded {
 		corner = b.scale(56)
 	}
-	if pen, _, _ := islandProcCreatePen.Call(0, 1, uintptr(0x00353535)); pen != 0 {
+	if b.penOutline != 0 {
 		nullBrush, _, _ := islandProcGetStockObject.Call(5)
-		oldPen, _, _ := islandProcSelectObject.Call(hdc, pen)
+		oldPen, _, _ := islandProcSelectObject.Call(hdc, b.penOutline)
 		var oldBrush uintptr
 		if nullBrush != 0 {
 			oldBrush, _, _ = islandProcSelectObject.Call(hdc, nullBrush)
@@ -898,7 +1088,6 @@ func (b *islandWinBackend) paint() {
 			islandProcSelectObject.Call(hdc, oldBrush)
 		}
 		islandProcSelectObject.Call(hdc, oldPen)
-		islandProcDeleteObject.Call(pen)
 	}
 	oldFont := uintptr(0)
 	if b.font != 0 {
@@ -909,7 +1098,7 @@ func (b *islandWinBackend) paint() {
 	orange := uintptr(0x00008CFF)
 	islandProcSetTextColor.Call(hdc, white)
 	if !b.expanded {
-		model := buildIslandViewModel(b.items, b.hasPending, true, false, time.Now())
+		model := b.islandModel()
 		title := b.collapsedTitle
 		if title == "" {
 			title = model.CollapsedTitle
@@ -938,10 +1127,9 @@ func (b *islandWinBackend) paint() {
 		}
 	} else {
 		drawIslandText(hdc, "倒计时", rect{left: 0, top: int32(scaleInt(b.dpi, 8)), right: client.right, bottom: int32(scaleInt(b.dpi, 42))}, dtCenter|dtVCenter|dtSingleLine)
-		if divBrush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x002A2A2A)); divBrush != 0 {
+		if b.brushDiv != 0 {
 			divRect := rect{left: int32(scaleInt(b.dpi, 12)), top: int32(scaleInt(b.dpi, 48)), right: client.right - int32(scaleInt(b.dpi, 12)), bottom: int32(scaleInt(b.dpi, 48)) + 1}
-			islandProcFillRect.Call(hdc, uintptr(unsafe.Pointer(&divRect)), divBrush)
-			islandProcDeleteObject.Call(divBrush)
+			islandProcFillRect.Call(hdc, uintptr(unsafe.Pointer(&divRect)), b.brushDiv)
 		}
 		items := b.visibleItems()
 		leavingIndex := b.leavingVisibleIndex()
@@ -963,30 +1151,25 @@ func (b *islandWinBackend) paint() {
 				cardBottom = cardTop
 			}
 			cardCorner := int32(scaleInt(b.dpi, 20))
-			cardFill := uintptr(0x00202020)
-			cardBorder := uintptr(0x00333333)
+			// Row card: slightly lighter fill + 1px border. Only the border
+			// changes on hover; the card surface stays put so the small
+			// action pill is the single hover target.
+			cardPen := b.penCard
 			if visibleIndex == b.hoverRow && b.leavingID == "" {
-				// Only the border changes; the card surface stays put so the
-				// small action pill is the single hover target.
-				cardBorder = 0x004A4A4A
+				cardPen = b.penCardHover
 			}
-			// Row card: slightly lighter fill + 1px border.
-			if cardBrush, _, _ := islandProcCreateSolidBrush.Call(cardFill); cardBrush != 0 {
-				if cardPen, _, _ := islandProcCreatePen.Call(0, 1, cardBorder); cardPen != 0 {
-					oldPen, _, _ := islandProcSelectObject.Call(hdc, cardPen)
-					oldBrush, _, _ := islandProcSelectObject.Call(hdc, cardBrush)
-					islandProcRoundRect.Call(hdc, uintptr(cardLeft), uintptr(cardTop), uintptr(cardRight), uintptr(cardBottom), uintptr(cardCorner), uintptr(cardCorner))
-					islandProcSelectObject.Call(hdc, oldBrush)
-					islandProcSelectObject.Call(hdc, oldPen)
-					islandProcDeleteObject.Call(cardPen)
-				}
-				islandProcDeleteObject.Call(cardBrush)
+			if b.brushCard != 0 && cardPen != 0 {
+				oldPen, _, _ := islandProcSelectObject.Call(hdc, cardPen)
+				oldBrush, _, _ := islandProcSelectObject.Call(hdc, b.brushCard)
+				islandProcRoundRect.Call(hdc, uintptr(cardLeft), uintptr(cardTop), uintptr(cardRight), uintptr(cardBottom), uintptr(cardCorner), uintptr(cardCorner))
+				islandProcSelectObject.Call(hdc, oldBrush)
+				islandProcSelectObject.Call(hdc, oldPen)
 			}
 			sub := ""
 			status := normalizedTrayStatus(item.Status)
 			switch status {
 			case statusRunning:
-				sub = formatRemaining(item.EndsAt, time.Now())
+				sub = formatRemaining(item.EndsAt, now)
 			case statusPaused:
 				sub = formatSeconds(item.RemainingSeconds) + " 已暂停"
 			case statusPending:
@@ -1043,25 +1226,20 @@ func (b *islandWinBackend) paint() {
 				if pillRect.left < cardLeft+2 {
 					pillRect.left = cardLeft + 2
 				}
-				if pill, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x003A3A3A)); pill != 0 {
-					if pen, _, _ := islandProcCreatePen.Call(0, 1, uintptr(0x005A5A5A)); pen != 0 {
-						oldPen, _, _ := islandProcSelectObject.Call(hdc, pen)
-						oldBrush, _, _ := islandProcSelectObject.Call(hdc, pill)
-						islandProcRoundRect.Call(hdc, uintptr(pillRect.left), uintptr(pillRect.top), uintptr(pillRect.right), uintptr(pillRect.bottom), uintptr(scaleInt(b.dpi, 14)), uintptr(scaleInt(b.dpi, 14)))
-						islandProcSelectObject.Call(hdc, oldBrush)
-						islandProcSelectObject.Call(hdc, oldPen)
-						islandProcDeleteObject.Call(pen)
-					}
-					islandProcDeleteObject.Call(pill)
+				if b.brushPill != 0 && b.penPill != 0 {
+					oldPen, _, _ := islandProcSelectObject.Call(hdc, b.penPill)
+					oldBrush, _, _ := islandProcSelectObject.Call(hdc, b.brushPill)
+					islandProcRoundRect.Call(hdc, uintptr(pillRect.left), uintptr(pillRect.top), uintptr(pillRect.right), uintptr(pillRect.bottom), uintptr(scaleInt(b.dpi, 14)), uintptr(scaleInt(b.dpi, 14)))
+					islandProcSelectObject.Call(hdc, oldBrush)
+					islandProcSelectObject.Call(hdc, oldPen)
 				}
 			}
 			drawIslandText(hdc, left, firstRect, dtCenter|dtVCenter|dtSingleLine)
 			drawIslandText(hdc, right, secondRect, dtCenter|dtVCenter|dtSingleLine)
 		}
-		if divBrush, _, _ := islandProcCreateSolidBrush.Call(uintptr(0x002A2A2A)); divBrush != 0 {
+		if b.brushDiv != 0 {
 			divRect := rect{left: int32(scaleInt(b.dpi, 12)), top: client.bottom - int32(scaleInt(b.dpi, 42)), right: client.right - int32(scaleInt(b.dpi, 12)), bottom: client.bottom - int32(scaleInt(b.dpi, 42)) + 1}
-			islandProcFillRect.Call(hdc, uintptr(unsafe.Pointer(&divRect)), divBrush)
-			islandProcDeleteObject.Call(divBrush)
+			islandProcFillRect.Call(hdc, uintptr(unsafe.Pointer(&divRect)), b.brushDiv)
 		}
 		drawIslandText(hdc, "打开列表", rect{left: int32(scaleInt(b.dpi, 12)), top: client.bottom - int32(scaleInt(b.dpi, 38)), right: int32(b.width / 2), bottom: client.bottom}, dtLeft|dtVCenter|dtSingleLine)
 		if b.hasPending {
