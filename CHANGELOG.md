@@ -1,3 +1,6 @@
+## 1.8.2
+- 灵动岛改用 UpdateLayeredWindow + 32bpp DIB 重写（第 4 项完成，无行为变化）：渲染改走内存 DC 里的 32bpp DIB（BI_RGB、自顶向下），逐像素 alpha 取代 SetLayeredWindowAttributes 统一透明度与 CreateRoundRectRgn 区域裁剪；圆角按圆角矩形几何算 alpha 掩码（边缘约 1px 抗锯齿过渡，圆角椭圆宽高 36/56、实际半径 18/28），颜色通道预乘；呼吸脉冲与进出动画的透明度改走 BLENDFUNCTION.SourceConstantAlpha；透明角落改由 WM_NCHITTEST 返回 HTTRANSPARENT 保持点透。DIB 按岛最大尺寸分配并复用（动画帧不重建），掩码按尺寸/圆角缓存，退出时释放 DIB 与内存 DC；1.8.1 的互斥锁注册表、三缓存、GDI 对象缓存与脉冲跳过优化全部保留。新增跨平台单测：alpha 掩码、圆角点命中、预乘像素。
+
 ## 1.8.1
 - 灵动岛动画路径优化（无行为变化）：窗口句柄到后端的映射改由互斥锁保护的注册表，不再用无锁的包级全局指针；可见计时器列表与离场序号按需缓存，刷新/滚动/离场才失效；视图模型一次布局周期只建一次，1 秒 tick 才失效；固定颜色的画刷/画笔缓存复用，paint 不再每帧新建销毁；1 秒 tick 只失效计时文字所在的行区域；呼吸脉冲透明度不变时跳过系统调用。
 - 第 4 项（UpdateLayeredWindow + 32bpp DIB 重写）不在本轮，单独一轮做并配真机截图验收。

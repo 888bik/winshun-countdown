@@ -17,8 +17,6 @@ func TestIslandProcsResolve(t *testing.T) {
 		proc *syscall.LazyProc
 	}{
 		{"TrackMouseEvent", islandProcTrackMouseEvent},
-		{"SetWindowRgn", islandProcSetWindowRgn},
-		{"CreateRoundRectRgn", islandProcCreateRoundRectRgn},
 		{"RoundRect", islandProcRoundRect},
 		{"CreatePen", islandProcCreatePen},
 		{"GetCursorPos", islandProcGetCursorPos},
@@ -27,7 +25,6 @@ func TestIslandProcsResolve(t *testing.T) {
 		{"GetSystemMetrics", islandProcGetSystemMetrics},
 		{"InvalidateRect", islandProcInvalidateRect},
 		{"GetStockObject", islandProcGetStockObject},
-		{"SetLayeredWindowAttributes", islandProcSetLayeredWindowAttributes},
 		{"RegisterClassExW", islandProcRegisterClassEx},
 		{"CreateWindowExW", islandProcCreateWindowEx},
 		{"DestroyWindow", islandProcDestroyWindow},
@@ -56,9 +53,13 @@ func TestIslandProcsResolve(t *testing.T) {
 		{"GetDC", islandProcGetDC},
 		{"ReleaseDC", islandProcReleaseDC},
 		{"GetTextExtentPoint32W", islandProcGetTextExtentPoint32},
+		{"UpdateLayeredWindow", islandProcUpdateLayeredWindow},
+		{"CreateDIBSection", islandProcCreateDIBSection},
+		{"CreateCompatibleDC", islandProcCreateCompatibleDC},
+		{"DeleteDC", islandProcDeleteDC},
 	}
-	if len(procs) != 40 {
-		t.Fatalf("island proc list has %d entries, want 37; update the list when procs are added", len(procs))
+	if len(procs) != 41 {
+		t.Fatalf("island proc list has %d entries, want 41; update the list when procs are added", len(procs))
 	}
 	for _, p := range procs {
 		if err := p.proc.Find(); err != nil {

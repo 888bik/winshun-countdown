@@ -42,3 +42,81 @@ func TestIslandLeaveFraction(t *testing.T) {
 		t.Fatalf("zero start = %v, %v", got, done)
 	}
 }
+
+func TestIslandAlphaMask(t *testing.T) {
+	mask := islandAlphaMask(20, 12, 8) // corner ellipse 8 -> radius 4
+	if len(mask) != 20*12 {
+		t.Fatalf("mask length = %d, want %d", len(mask), 20*12)
+	}
+	if got := mask[6*20+10]; got != 255 {
+		t.Fatalf("centre = %d, want 255", got)
+	}
+	if got := mask[0]; got != 0 {
+		t.Fatalf("far corner (0,0) = %d, want 0", got)
+	}
+	if got := mask[0*20+10]; got != 255 {
+		t.Fatalf("top edge middle = %d, want 255", got)
+	}
+	if got := mask[6*20+0]; got != 255 {
+		t.Fatalf("left edge middle = %d, want 255", got)
+	}
+	if got := mask[1*20+1]; got <= 0 || got >= 255 {
+		t.Fatalf("near-corner (1,1) = %d, want partial coverage", got)
+	}
+	plain := islandAlphaMask(10, 10, 0)
+	for i, v := range plain {
+		if v != 255 {
+			t.Fatalf("corner 0: mask[%d] = %d, want 255", i, v)
+		}
+	}
+}
+
+func TestIslandPointInRoundedRect(t *testing.T) {
+	// 20x12, corner ellipse 8 -> radius 4, corner circle centre (4,4).
+	cases := []struct {
+		x, y int
+		want bool
+	}{
+		{10, 6, true},  // centre
+		{10, 0, true},  // top edge
+		{0, 6, true},   // left edge
+		{3, 3, true},   // inside the corner circle
+		{1, 1, true},   // inside the ellipse (dist 3.54 < 4)
+		{0, 1, false},  // outside the ellipse (dist 4.30 > 4)
+		{0, 0, false},  // far corner
+		{-1, 6, false}, // outside the window
+		{20, 6, false}, // outside the window
+	}
+	for _, tc := range cases {
+		if got := islandPointInRoundedRect(tc.x, tc.y, 20, 12, 8); got != tc.want {
+			t.Fatalf("(%d,%d) = %v, want %v", tc.x, tc.y, got, tc.want)
+		}
+	}
+}
+
+func TestPremultiplyIslandPixels(t *testing.T) {
+	// Pixels as GDI leaves them: RGB set, alpha byte zero.
+	red := uint32(0x00FF0000) // R=255
+	white := uint32(0x00FFFFFF)
+	pixels := []uint32{red, red, white, 0}
+	mask := []byte{255, 0, 128, 255}
+	premultiplyIslandPixels(pixels, mask)
+	if pixels[0] != 0xFFFF0000 {
+		t.Fatalf("opaque red = %#x, want 0xFFFF0000", pixels[0])
+	}
+	if pixels[1] != 0 {
+		t.Fatalf("masked-out = %#x, want 0", pixels[1])
+	}
+	if pixels[2] != 0x80808080 {
+		t.Fatalf("half white = %#x, want 0x80808080", pixels[2])
+	}
+	if pixels[3] != 0xFF000000 {
+		t.Fatalf("opaque black = %#x, want 0xFF000000", pixels[3])
+	}
+	// A mask shorter than the pixels leaves the tail untouched.
+	tail := []uint32{red, red}
+	premultiplyIslandPixels(tail, []byte{255})
+	if tail[1] != red {
+		t.Fatalf("tail = %#x, want untouched %#x", tail[1], red)
+	}
+}

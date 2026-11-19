@@ -41,6 +41,12 @@ const (
 	islandCollapsedMax  = 300
 	islandCollapsedPad  = 12
 	islandCollapsedGap  = 8
+	islandWMNCHitTest   = 0x0084
+	islandHTTransparent = ^uintptr(0) // HTTRANSPARENT
+	islandHTClient      = 0x00000001
+	islandULWAlpha      = 0x00000002
+	islandACSrcOver     = 0x00
+	islandACSrcAlpha    = 0x01
 )
 
 type islandTrackMouseEvent struct {
@@ -51,50 +57,51 @@ type islandTrackMouseEvent struct {
 }
 
 var (
-	islandUser32                         = syscall.NewLazyDLL("user32.dll")
-	islandGDI32                          = syscall.NewLazyDLL("gdi32.dll")
-	islandProcTrackMouseEvent            = islandUser32.NewProc("TrackMouseEvent")
-	islandProcSetWindowRgn               = islandUser32.NewProc("SetWindowRgn")
-	islandProcCreateRoundRectRgn         = islandGDI32.NewProc("CreateRoundRectRgn")
-	islandProcRoundRect                  = islandGDI32.NewProc("RoundRect")
-	islandProcCreatePen                  = islandGDI32.NewProc("CreatePen")
-	islandProcGetCursorPos               = islandUser32.NewProc("GetCursorPos")
-	islandProcGetWindowRect              = islandUser32.NewProc("GetWindowRect")
-	islandProcSetWindowPos               = islandUser32.NewProc("SetWindowPos")
-	islandProcGetSystemMetrics           = islandUser32.NewProc("GetSystemMetrics")
-	islandProcInvalidateRect             = islandUser32.NewProc("InvalidateRect")
-	islandProcGetStockObject             = islandGDI32.NewProc("GetStockObject")
-	islandProcSetLayeredWindowAttributes = islandUser32.NewProc("SetLayeredWindowAttributes")
-	islandProcRegisterClassEx            = islandUser32.NewProc("RegisterClassExW")
-	islandProcCreateWindowEx             = islandUser32.NewProc("CreateWindowExW")
-	islandProcDestroyWindow              = islandUser32.NewProc("DestroyWindow")
-	islandProcShowWindow                 = islandUser32.NewProc("ShowWindow")
-	islandProcSetTimer                   = islandUser32.NewProc("SetTimer")
-	islandProcKillTimer                  = islandUser32.NewProc("KillTimer")
-	islandProcDefWindowProc              = islandUser32.NewProc("DefWindowProcW")
-	islandProcGetModuleHandle            = syscall.NewLazyDLL("kernel32.dll").NewProc("GetModuleHandleW")
-	islandProcFillRect                   = islandUser32.NewProc("FillRect")
-	islandProcCreateSolidBrush           = islandGDI32.NewProc("CreateSolidBrush")
-	islandProcDeleteObject               = islandGDI32.NewProc("DeleteObject")
-	islandProcSelectObject               = islandGDI32.NewProc("SelectObject")
-	islandProcSetTextColor               = islandGDI32.NewProc("SetTextColor")
-	islandProcSetBkMode                  = islandGDI32.NewProc("SetBkMode")
-	islandProcDrawText                   = islandUser32.NewProc("DrawTextW")
-	islandProcCreateFont                 = islandGDI32.NewProc("CreateFontW")
-	islandProcBeginPaint                 = islandUser32.NewProc("BeginPaint")
-	islandProcEndPaint                   = islandUser32.NewProc("EndPaint")
-	islandProcGetClientRect              = islandUser32.NewProc("GetClientRect")
-	islandProcPostMessage                = islandUser32.NewProc("PostMessageW")
-	islandProcGetMessage                 = islandUser32.NewProc("GetMessageW")
-	islandProcTranslateMessage           = islandUser32.NewProc("TranslateMessage")
-	islandProcDispatchMessage            = islandUser32.NewProc("DispatchMessageW")
-	islandProcPostQuitMessage            = islandUser32.NewProc("PostQuitMessage")
-	islandProcGetDpiForWindow            = islandUser32.NewProc("GetDpiForWindow")
-	islandProcGetDC                      = islandUser32.NewProc("GetDC")
-	islandProcReleaseDC                  = islandUser32.NewProc("ReleaseDC")
-	islandProcGetTextExtentPoint32       = islandGDI32.NewProc("GetTextExtentPoint32W")
-	islandClassMu                        sync.Mutex
-	islandClassRegistered                bool
+	islandUser32                   = syscall.NewLazyDLL("user32.dll")
+	islandGDI32                    = syscall.NewLazyDLL("gdi32.dll")
+	islandProcTrackMouseEvent      = islandUser32.NewProc("TrackMouseEvent")
+	islandProcRoundRect            = islandGDI32.NewProc("RoundRect")
+	islandProcCreatePen            = islandGDI32.NewProc("CreatePen")
+	islandProcGetCursorPos         = islandUser32.NewProc("GetCursorPos")
+	islandProcGetWindowRect        = islandUser32.NewProc("GetWindowRect")
+	islandProcSetWindowPos         = islandUser32.NewProc("SetWindowPos")
+	islandProcGetSystemMetrics     = islandUser32.NewProc("GetSystemMetrics")
+	islandProcInvalidateRect       = islandUser32.NewProc("InvalidateRect")
+	islandProcGetStockObject       = islandGDI32.NewProc("GetStockObject")
+	islandProcRegisterClassEx      = islandUser32.NewProc("RegisterClassExW")
+	islandProcCreateWindowEx       = islandUser32.NewProc("CreateWindowExW")
+	islandProcDestroyWindow        = islandUser32.NewProc("DestroyWindow")
+	islandProcShowWindow           = islandUser32.NewProc("ShowWindow")
+	islandProcSetTimer             = islandUser32.NewProc("SetTimer")
+	islandProcKillTimer            = islandUser32.NewProc("KillTimer")
+	islandProcDefWindowProc        = islandUser32.NewProc("DefWindowProcW")
+	islandProcGetModuleHandle      = syscall.NewLazyDLL("kernel32.dll").NewProc("GetModuleHandleW")
+	islandProcFillRect             = islandUser32.NewProc("FillRect")
+	islandProcCreateSolidBrush     = islandGDI32.NewProc("CreateSolidBrush")
+	islandProcDeleteObject         = islandGDI32.NewProc("DeleteObject")
+	islandProcSelectObject         = islandGDI32.NewProc("SelectObject")
+	islandProcSetTextColor         = islandGDI32.NewProc("SetTextColor")
+	islandProcSetBkMode            = islandGDI32.NewProc("SetBkMode")
+	islandProcDrawText             = islandUser32.NewProc("DrawTextW")
+	islandProcCreateFont           = islandGDI32.NewProc("CreateFontW")
+	islandProcBeginPaint           = islandUser32.NewProc("BeginPaint")
+	islandProcEndPaint             = islandUser32.NewProc("EndPaint")
+	islandProcGetClientRect        = islandUser32.NewProc("GetClientRect")
+	islandProcPostMessage          = islandUser32.NewProc("PostMessageW")
+	islandProcGetMessage           = islandUser32.NewProc("GetMessageW")
+	islandProcTranslateMessage     = islandUser32.NewProc("TranslateMessage")
+	islandProcDispatchMessage      = islandUser32.NewProc("DispatchMessageW")
+	islandProcPostQuitMessage      = islandUser32.NewProc("PostQuitMessage")
+	islandProcGetDpiForWindow      = islandUser32.NewProc("GetDpiForWindow")
+	islandProcGetDC                = islandUser32.NewProc("GetDC")
+	islandProcReleaseDC            = islandUser32.NewProc("ReleaseDC")
+	islandProcGetTextExtentPoint32 = islandGDI32.NewProc("GetTextExtentPoint32W")
+	islandProcUpdateLayeredWindow  = islandUser32.NewProc("UpdateLayeredWindow")
+	islandProcCreateDIBSection     = islandGDI32.NewProc("CreateDIBSection")
+	islandProcCreateCompatibleDC   = islandGDI32.NewProc("CreateCompatibleDC")
+	islandProcDeleteDC             = islandGDI32.NewProc("DeleteDC")
+	islandClassMu                  sync.Mutex
+	islandClassRegistered          bool
 	// islandBackends maps window handles to their backend. The window
 	// procedure runs on the GUI thread while the backend is created and
 	// torn down from the plugin, so the lookup is guarded by a mutex:
@@ -192,6 +199,22 @@ type islandWinBackend struct {
 	// skips the system call while the value is unchanged and no size
 	// animation is running.
 	lastPulseAlpha int
+	// DIB backing store for UpdateLayeredWindow. dibDC draws into
+	// dibBitmap; dibBits points at its pixels. The bitmap is sized to
+	// the largest island ever shown and never shrunk; present() only
+	// uploads the current window rectangle from its top-left corner.
+	dibDC        uintptr
+	dibBitmap    uintptr
+	dibOldBitmap uintptr
+	dibBits      unsafe.Pointer
+	dibW         int
+	dibH         int
+	// Alpha mask for the current window size and corner, cached until
+	// the geometry changes. mask[i] is the coverage of pixel i.
+	dibMask       []byte
+	dibMaskW      int
+	dibMaskH      int
+	dibMaskCorner int
 }
 
 type islandMessage struct {
@@ -204,8 +227,38 @@ type islandMessage struct {
 	lPrivate uint32
 }
 
+type islandBitmapInfoHeader struct {
+	size          uint32
+	width         int32
+	height        int32
+	planes        uint16
+	bitCount      uint16
+	compression   uint32
+	sizeImage     uint32
+	xPelsPerMeter int32
+	yPelsPerMeter int32
+	clrUsed       uint32
+	clrImportant  uint32
+}
+
+type islandBitmapInfo struct {
+	header islandBitmapInfoHeader
+	colors uint32 // one RGBQUAD; unused for 32bpp BI_RGB
+}
+
+type islandBlendFunction struct {
+	blendOp             byte
+	blendFlags          byte
+	sourceConstantAlpha byte
+	alphaFormat         byte
+}
+
+type islandSize struct {
+	cx, cy int32
+}
+
 func newIslandBackend(callbacks islandCallbacks) islandBackend {
-	b := &islandWinBackend{callbacks: callbacks, ready: make(chan bool, 1), dpi: 96, width: islandBaseWidth, height: islandBaseHeight, hoverRow: -1, hoverHalf: -1, lastPulseAlpha: -1}
+	b := &islandWinBackend{callbacks: callbacks, ready: make(chan bool, 1), dpi: 96, width: islandBaseWidth, height: islandBaseHeight, hoverRow: -1, hoverHalf: -1, lastPulseAlpha: -1, alpha: 255}
 	go b.loop()
 	<-b.ready
 	return b
@@ -287,6 +340,7 @@ func (b *islandWinBackend) loop() {
 		b.font = 0
 	}
 	b.destroyGDI()
+	b.destroyDIB()
 	// Window teardown is the final safety net for a leave animation.
 	b.finishLeave()
 	if b.hwnd != 0 {
@@ -325,11 +379,8 @@ func (b *islandWinBackend) ensureWindow() bool {
 	}
 	b.hwnd = hwnd
 	b.dpi = b.getDPI()
-	// A rounded native region keeps the transparent corners click-through. The
-	// layered alpha is uniform; all drawing remains on the GUI thread.
-	if result, _, _ := islandProcSetLayeredWindowAttributes.Call(hwnd, 0, 255, 0x2); result == 0 {
-		return false
-	}
+	// The layered window starts fully transparent; the first render
+	// presents the DIB with UpdateLayeredWindow.
 	// Register only once the window is fully built; messages that arrive
 	// during creation (WM_NCCREATE, WM_CREATE, ...) get default handling
 	// from DefWindowProc until then.
@@ -350,6 +401,18 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 		case wmPaint:
 			b.paint()
 			return 0
+		case islandWMNCHitTest:
+			// lParam carries screen coordinates. Transparent corners
+			// stay click-through, as they were with the window region.
+			var bounds rect
+			if ok, _, _ := islandProcGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&bounds))); ok != 0 {
+				x := int(int16(lParam)) - int(bounds.left)
+				y := int(int16(lParam>>16)) - int(bounds.top)
+				if !islandPointInRoundedRect(x, y, b.width, b.height, b.corner) {
+					return uintptr(islandHTTransparent)
+				}
+				return uintptr(islandHTClient)
+			}
 		case islandWMCommand:
 			b.drain()
 			return 0
@@ -395,7 +458,10 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 				// rewriting alpha in the meantime.
 				if b.animating || int(alpha) != b.lastPulseAlpha {
 					b.lastPulseAlpha = int(alpha)
-					islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
+					// Only the global alpha changed: re-present the
+					// existing DIB instead of redrawing it.
+					b.alpha = int(alpha)
+					b.present()
 				}
 			case islandTimerAnim:
 				progress, done := b.anim.progress(time.Now())
@@ -403,14 +469,15 @@ func islandWndProc(hwnd uintptr, message, wParam, lParam uintptr) uintptr {
 				if b.anim.kind == animExit {
 					alpha = byte(255 - int(18*progress))
 				}
-				islandProcSetLayeredWindowAttributes.Call(hwnd, 0, uintptr(alpha), 0x2)
+				// The frame alpha is picked up by the render that
+				// applyAnimFrame triggers through InvalidateRect.
+				b.alpha = int(alpha)
 				b.applyAnimFrame(progress)
 				if done {
 					islandProcKillTimer.Call(hwnd, islandTimerAnim)
 					b.animating = false
 					b.alpha = 255
 					b.lastPulseAlpha = 255
-					islandProcSetLayeredWindowAttributes.Call(hwnd, 0, 255, 0x2)
 					b.layout()
 				}
 			case islandTimerLeaveRow:
@@ -541,7 +608,6 @@ func (b *islandWinBackend) updateVisibility() {
 		islandProcKillTimer.Call(b.hwnd, 2)
 		b.alpha = 255
 		b.lastPulseAlpha = 255
-		islandProcSetLayeredWindowAttributes.Call(b.hwnd, 0, 255, 0x2)
 	}
 	b.layout()
 	// One-second tick: the collapsed text and the expanded rows show the
@@ -710,17 +776,9 @@ func (b *islandWinBackend) applyIslandSize(width, height, corner int) {
 	screenW, _, _ := islandProcGetSystemMetrics.Call(0)
 	x := (int(screenW) - b.width) / 2
 	y := 0
-	region, _, _ := islandProcCreateRoundRectRgn.Call(0, 0, uintptr(b.width+1), uintptr(b.height+1), uintptr(corner), uintptr(corner))
-	if region != 0 {
-		if result, _, _ := islandProcSetWindowRgn.Call(b.hwnd, region, 1); result == 0 {
-			islandProcDeleteObject.Call(region)
-			b.failOnGUI()
-			return
-		}
-	} else {
-		b.failOnGUI()
-		return
-	}
+	// No window region: the rounded shape now comes from the DIB's
+	// per-pixel alpha, and WM_NCHITTEST keeps the transparent corners
+	// click-through.
 	if result, _, _ := islandProcSetWindowPos.Call(b.hwnd, 0, uintptr(x), uintptr(y), uintptr(b.width), uintptr(b.height), islandSWPNoActivate|islandSWPNoZOrder|islandSWPShowWindow); result == 0 {
 		b.failOnGUI()
 		return
@@ -1056,12 +1114,24 @@ func (b *islandWinBackend) paint() {
 	if b.hwnd == 0 {
 		return
 	}
+	// Validate the update region. All drawing goes to the DIB and is
+	// presented with UpdateLayeredWindow, never to the window DC.
 	var ps paintStruct
 	hdc, _, _ := islandProcBeginPaint.Call(b.hwnd, uintptr(unsafe.Pointer(&ps)))
 	if hdc == 0 {
 		return
 	}
-	defer islandProcEndPaint.Call(b.hwnd, uintptr(unsafe.Pointer(&ps)))
+	islandProcEndPaint.Call(b.hwnd, uintptr(unsafe.Pointer(&ps)))
+	b.render()
+}
+
+// renderIsland draws the island into hdc, which is the DIB memory DC
+// when presenting. Colours are written without alpha;
+// applyDIBAlpha supplies the alpha channel afterwards.
+func (b *islandWinBackend) renderIsland(hdc uintptr) {
+	if b.hwnd == 0 || hdc == 0 {
+		return
+	}
 	var client rect
 	islandProcGetClientRect.Call(b.hwnd, uintptr(unsafe.Pointer(&client)))
 	b.ensureGDI()
@@ -1248,6 +1318,131 @@ func (b *islandWinBackend) paint() {
 	}
 	if oldFont != 0 {
 		islandProcSelectObject.Call(hdc, oldFont)
+	}
+}
+
+// ensureDIB makes sure a DIB section at least width x height exists.
+// The bitmap is sized to the largest island ever shown and never
+// shrunk, so size animations do not reallocate it on every frame.
+func (b *islandWinBackend) ensureDIB(width, height int) bool {
+	if width <= 0 || height <= 0 {
+		return false
+	}
+	if b.dibDC != 0 && b.dibBitmap != 0 && b.dibW >= width && b.dibH >= height {
+		return true
+	}
+	b.destroyDIB()
+	allocW, allocH := width, height
+	if maxW := b.scale(islandExpandedWidth); allocW < maxW {
+		allocW = maxW
+	}
+	if maxH := b.scale(58 + islandMaxRows*islandRowHeight + 42); allocH < maxH {
+		allocH = maxH
+	}
+	hdc, _, _ := islandProcGetDC.Call(0)
+	if hdc == 0 {
+		return false
+	}
+	defer islandProcReleaseDC.Call(0, hdc)
+	memDC, _, _ := islandProcCreateCompatibleDC.Call(hdc)
+	if memDC == 0 {
+		return false
+	}
+	info := islandBitmapInfo{}
+	info.header.size = uint32(unsafe.Sizeof(islandBitmapInfoHeader{}))
+	info.header.width = int32(allocW)
+	info.header.height = -int32(allocH) // top-down DIB
+	info.header.planes = 1
+	info.header.bitCount = 32
+	info.header.compression = 0 // BI_RGB
+	var bits unsafe.Pointer
+	bitmap, _, _ := islandProcCreateDIBSection.Call(hdc, uintptr(unsafe.Pointer(&info)), 0, uintptr(unsafe.Pointer(&bits)), 0, 0)
+	if bitmap == 0 || bits == nil {
+		islandProcDeleteDC.Call(memDC)
+		return false
+	}
+	old, _, _ := islandProcSelectObject.Call(memDC, bitmap)
+	b.dibDC = memDC
+	b.dibBitmap = bitmap
+	b.dibOldBitmap = old
+	b.dibBits = bits
+	b.dibW = allocW
+	b.dibH = allocH
+	return true
+}
+
+// destroyDIB releases the DIB section and its memory DC. Only call it
+// after the message loop ends, when no paint can use them.
+func (b *islandWinBackend) destroyDIB() {
+	if b.dibDC != 0 {
+		if b.dibBitmap != 0 && b.dibOldBitmap != 0 {
+			islandProcSelectObject.Call(b.dibDC, b.dibOldBitmap)
+		}
+		islandProcDeleteDC.Call(b.dibDC)
+		b.dibDC = 0
+	}
+	if b.dibBitmap != 0 {
+		islandProcDeleteObject.Call(b.dibBitmap)
+		b.dibBitmap = 0
+	}
+	b.dibBits = nil
+	b.dibW, b.dibH = 0, 0
+	b.dibOldBitmap = 0
+	b.dibMask = nil
+	b.dibMaskW, b.dibMaskH, b.dibMaskCorner = 0, 0, 0
+}
+
+// render draws the island into the DIB and presents it with
+// UpdateLayeredWindow. The DIB is reused across frames; only the
+// current window rectangle (from the top-left corner) is uploaded.
+func (b *islandWinBackend) render() {
+	if b.hwnd == 0 || b.width <= 0 || b.height <= 0 {
+		return
+	}
+	if !b.ensureDIB(b.width, b.height) {
+		b.failOnGUI()
+		return
+	}
+	b.renderIsland(b.dibDC)
+	b.applyDIBAlpha()
+	b.present()
+}
+
+// applyDIBAlpha writes the cached rounded-rect mask into the DIB's
+// alpha channel and premultiplies the colour channels.
+func (b *islandWinBackend) applyDIBAlpha() {
+	if b.dibBits == nil || b.width <= 0 || b.height <= 0 {
+		return
+	}
+	if b.dibMask == nil || b.dibMaskW != b.width || b.dibMaskH != b.height || b.dibMaskCorner != b.corner {
+		b.dibMask = islandAlphaMask(b.width, b.height, b.corner)
+		b.dibMaskW, b.dibMaskH, b.dibMaskCorner = b.width, b.height, b.corner
+	}
+	n := b.width * b.height
+	pixels := unsafe.Slice((*uint32)(b.dibBits), n)
+	premultiplyIslandPixels(pixels, b.dibMask)
+}
+
+// present uploads the current DIB contents with the current global
+// alpha. It does not redraw: call it when only the pulse or animation
+// alpha changed.
+func (b *islandWinBackend) present() {
+	if b.hwnd == 0 || b.dibDC == 0 || b.width <= 0 || b.height <= 0 {
+		return
+	}
+	screenW, _, _ := islandProcGetSystemMetrics.Call(0)
+	dst := point{x: int32((int(screenW) - b.width) / 2), y: 0}
+	size := islandSize{cx: int32(b.width), cy: int32(b.height)}
+	src := point{x: 0, y: 0}
+	blend := islandBlendFunction{blendOp: islandACSrcOver, blendFlags: 0, sourceConstantAlpha: byte(b.alpha), alphaFormat: islandACSrcAlpha}
+	result, _, _ := islandProcUpdateLayeredWindow.Call(
+		b.hwnd, 0,
+		uintptr(unsafe.Pointer(&dst)), uintptr(unsafe.Pointer(&size)),
+		b.dibDC, uintptr(unsafe.Pointer(&src)),
+		0, uintptr(unsafe.Pointer(&blend)), uintptr(islandULWAlpha),
+	)
+	if result == 0 {
+		b.failOnGUI()
 	}
 }
 
