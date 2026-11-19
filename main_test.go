@@ -2474,8 +2474,8 @@ func TestIslandVisibilityRules(t *testing.T) {
 	if got := buildIslandViewModel(running, false, true, false, now); !got.Visible {
 		t.Fatal("island should be visible with a running timer")
 	}
-	if got := buildIslandViewModel(paused, false, true, false, now); got.Visible {
-		t.Fatal("island should hide when only paused timers exist")
+	if got := buildIslandViewModel(paused, false, true, false, now); !got.Visible || got.CollapsedText != "01:30 已暂停" || got.HasPending {
+		t.Fatalf("paused-only model = %#v", got)
 	}
 	if got := buildIslandViewModel(nil, false, true, false, now); got.Visible {
 		t.Fatal("island should hide when no timers exist")
@@ -2526,6 +2526,15 @@ func TestIslandCollapsedTitleAndExtra(t *testing.T) {
 	model = buildIslandViewModel(pending, true, true, false, now)
 	if model.CollapsedTitle != "吃饭" || model.CollapsedExtra != 1 || model.CollapsedText != "已到期" {
 		t.Fatalf("pending model = %#v", model)
+	}
+
+	mixed := []trayTimerSnapshot{
+		{ID: "pause", Title: "休息", Status: statusPaused, RemainingSeconds: 300},
+		{ID: "late", Title: "午休", Status: statusPending, EndedAt: now.Add(-time.Minute)},
+	}
+	model = buildIslandViewModel(mixed, true, true, false, now)
+	if model.CollapsedTitle != "午休" || model.CollapsedExtra != 1 || model.CollapsedText != "已到期" {
+		t.Fatalf("paused+pending model = %#v", model)
 	}
 	if !model.Visible {
 		t.Fatal("pending-only island should be visible")

@@ -174,8 +174,7 @@ func buildIslandViewModel(items []trayTimerSnapshot, hasPending, enabled, expand
 		}
 	}
 	if earliest == nil {
-		// No running timer: the earliest pending item becomes the main one;
-		// paused timers only contribute to the count.
+		// No running timer: the earliest pending item becomes the main one.
 		for i := range items {
 			item := &items[i]
 			if normalizedTrayStatus(item.Status) != statusPending {
@@ -192,6 +191,25 @@ func buildIslandViewModel(items []trayTimerSnapshot, hasPending, enabled, expand
 	} else {
 		model.Visible = true
 		model.CollapsedText = formatRemaining(earliest.EndsAt, now)
+	}
+	if earliest == nil {
+		// No running or pending timer: keep the island open on the
+		// paused timer with the least time left, so pausing does not
+		// close the island just when the user may want to resume.
+		// Items arrive sorted (running, paused by remaining, pending),
+		// so the first paused item is the least-remaining one.
+		for i := range items {
+			item := &items[i]
+			if normalizedTrayStatus(item.Status) != statusPaused {
+				continue
+			}
+			earliest = item
+			break
+		}
+		if earliest != nil {
+			model.Visible = true
+			model.CollapsedText = formatSeconds(earliest.RemainingSeconds) + " 已暂停"
+		}
 	}
 	if model.Visible && earliest != nil {
 		model.CollapsedTitle = truncateTrayTitle(earliest.Title, 6)
