@@ -693,20 +693,11 @@ func (b *islandWinBackend) collapsedWidth() int {
 		extraWidth = b.textExtent(hdc, extra)
 	}
 	measure := func(candidate string) int {
-		width := 2 * b.scale(islandCollapsedPad)
+		titleW := 0
 		if candidate != "" {
-			width += b.textExtent(hdc, candidate)
+			titleW = b.textExtent(hdc, candidate)
 		}
-		if text != "" {
-			if candidate != "" {
-				width += b.scale(islandCollapsedGap)
-			}
-			width += textWidth
-		}
-		if extra != "" {
-			width += b.scale(islandCollapsedGap) + extraWidth
-		}
-		return width
+		return islandCollapsedWidthFor(titleW, textWidth, extraWidth, b.scale(islandCollapsedPad), b.scale(islandCollapsedGap))
 	}
 	width := measure(title)
 	limit := b.scale(islandCollapsedMax)

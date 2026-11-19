@@ -156,3 +156,40 @@ func TestApplyIslandMaskStride(t *testing.T) {
 		t.Fatalf("last padding = %#x, want untouched 0x00FFFFFF", pixels[39])
 	}
 }
+
+func TestIslandCollapsedWidthFor(t *testing.T) {
+	pad, gap := 12, 8
+	cases := []struct {
+		name                  string
+		titleW, textW, extraW int
+		want                  int
+	}{
+		// Running timer: short middle text, the min-width clamp covers
+		// the centred span in practice; the helper itself returns the
+		// centred requirement (159).
+		{"running", 32, 55, 0, 159},
+		// Paused timer: long middle text ("04:46 已暂停"). Side by
+		// side would be 164, but the centred span needs 204, or the
+		// text starts inside the title.
+		{"paused", 32, 100, 0, 204},
+		// With a +N count the right side also binds.
+		{"with extra", 32, 55, 15, 159},
+		{"no title", 0, 55, 0, 95},
+	}
+	for _, tc := range cases {
+		got := islandCollapsedWidthFor(tc.titleW, tc.textW, tc.extraW, pad, gap)
+		if got != tc.want {
+			t.Fatalf("%s: width = %d, want %d", tc.name, got, tc.want)
+		}
+		// The centred middle span must clear the title (with a gap)
+		// on the left and the +N count (with a gap) on the right.
+		left := (got - tc.textW) / 2
+		right := (got + tc.textW) / 2
+		if left < pad+tc.titleW+gap {
+			t.Fatalf("%s: centred text starts at %d, inside title (want >= %d)", tc.name, left, pad+tc.titleW+gap)
+		}
+		if right > got-pad-tc.extraW-gap {
+			t.Fatalf("%s: centred text ends at %d, inside +N (want <= %d)", tc.name, right, got-pad-tc.extraW-gap)
+		}
+	}
+}

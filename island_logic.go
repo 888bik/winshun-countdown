@@ -178,3 +178,33 @@ func applyIslandMask(pixels []uint32, stride, width, height int, mask []byte) {
 		premultiplyIslandPixels(row, mask[y*width:y*width+width])
 	}
 }
+
+// islandCollapsedWidthFor returns the unclamped collapsed-pill width for
+// the given measured text extents (titleW/textW/extraW) and layout
+// metrics (pad/gap), all in the same (scaled) pixels. The middle text is
+// painted centred on the whole pill, not placed after the title, so the
+// side-by-side width is not enough: a long middle text (e.g. a paused
+// "04:46 已暂停") would start inside the title. The width must also keep
+// the centred span clear of the title on the left and of the +N count on
+// the right.
+func islandCollapsedWidthFor(titleW, textW, extraW, pad, gap int) int {
+	width := 2*pad + titleW
+	if textW > 0 {
+		if titleW > 0 {
+			width += gap
+		}
+		width += textW
+	}
+	if extraW > 0 {
+		width += gap + extraW
+	}
+	if textW > 0 {
+		if left := textW + 2*pad + 2*titleW + 2*gap; left > width {
+			width = left
+		}
+		if right := textW + 2*pad + 2*extraW + 2*gap; right > width {
+			width = right
+		}
+	}
+	return width
+}
