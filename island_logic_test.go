@@ -120,3 +120,39 @@ func TestPremultiplyIslandPixels(t *testing.T) {
 		t.Fatalf("tail = %#x, want untouched %#x", tail[1], red)
 	}
 }
+
+func TestApplyIslandMaskStride(t *testing.T) {
+	// Bitmap stride 10, window 6x4 (the 1.8.2 bug: the DIB is
+	// allocated at the largest island size, so its stride is wider
+	// than the window; applying the mask as if the rows were window
+	// wide shears it and leaves the lower rows transparent).
+	stride, width, height := 10, 6, 4
+	pixels := make([]uint32, stride*height)
+	for i := range pixels {
+		pixels[i] = 0x00FFFFFF // white, alpha 0 (as GDI leaves it)
+	}
+	mask := make([]byte, width*height)
+	for i := range mask {
+		mask[i] = 255
+	}
+	mask[0] = 0 // top-left corner pixel transparent
+	applyIslandMask(pixels, stride, width, height, mask)
+	if pixels[0] != 0 {
+		t.Fatalf("corner = %#x, want 0", pixels[0])
+	}
+	if pixels[5] != 0xFFFFFFFF {
+		t.Fatalf("row 0 last = %#x, want 0xFFFFFFFF", pixels[5])
+	}
+	if pixels[6] != 0x00FFFFFF {
+		t.Fatalf("row 0 padding = %#x, want untouched 0x00FFFFFF", pixels[6])
+	}
+	if pixels[10] != 0xFFFFFFFF {
+		t.Fatalf("row 1 first = %#x, want 0xFFFFFFFF", pixels[10])
+	}
+	if pixels[35] != 0xFFFFFFFF {
+		t.Fatalf("last row last = %#x, want 0xFFFFFFFF", pixels[35])
+	}
+	if pixels[39] != 0x00FFFFFF {
+		t.Fatalf("last padding = %#x, want untouched 0x00FFFFFF", pixels[39])
+	}
+}

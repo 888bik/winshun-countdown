@@ -1418,9 +1418,12 @@ func (b *islandWinBackend) applyDIBAlpha() {
 		b.dibMask = islandAlphaMask(b.width, b.height, b.corner)
 		b.dibMaskW, b.dibMaskH, b.dibMaskCorner = b.width, b.height, b.corner
 	}
-	n := b.width * b.height
-	pixels := unsafe.Slice((*uint32)(b.dibBits), n)
-	premultiplyIslandPixels(pixels, b.dibMask)
+	// The DIB rows are dibW wide, not width wide: the bitmap is
+	// allocated at the largest island size and reused. Applying the
+	// mask as if the rows were width wide shears it and leaves the
+	// lower rows with no alpha at all.
+	pixels := unsafe.Slice((*uint32)(b.dibBits), b.dibW*b.dibH)
+	applyIslandMask(pixels, b.dibW, b.width, b.height, b.dibMask)
 }
 
 // present uploads the current DIB contents with the current global

@@ -160,3 +160,21 @@ func premultiplyIslandPixels(pixels []uint32, mask []byte) {
 		pixels[i] = ai<<24 | (r*ai/255)<<16 | (g*ai/255)<<8 | b*ai/255
 	}
 }
+
+// applyIslandMask writes mask into pixels as the alpha channel and
+// premultiplies the colours, row by row. pixels holds a bitmap whose
+// rows are stride wide; only the left width pixels of each row belong
+// to the window. Treating the bitmap as if its rows were width wide
+// shears the mask and leaves the lower rows with no alpha at all.
+func applyIslandMask(pixels []uint32, stride, width, height int, mask []byte) {
+	if stride < width || width <= 0 || height <= 0 {
+		return
+	}
+	if len(pixels) < (height-1)*stride+width || len(mask) < width*height {
+		return
+	}
+	for y := 0; y < height; y++ {
+		row := pixels[y*stride : y*stride+width]
+		premultiplyIslandPixels(row, mask[y*width:y*width+width])
+	}
+}
